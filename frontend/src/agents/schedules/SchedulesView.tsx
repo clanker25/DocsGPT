@@ -1,0 +1,385 @@
+import { useEffect, useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useDispatch, useSelector } from 'react-redux';
+import { Link, useParams } from 'react-router-dom';
+
+import { Plus } from 'lucide-react';
+
+import { Badge } from '@/components/ui/badge';
+import { EmptyState } from '@/components/ui/empty-state';
+import { LoadingState } from '@/components/ui/loading-state';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import schedulesService from '../../api/services/schedulesService';
+import StatCard from '../../components/StatCard';
+import { Button } from '../../components/ui/button';
+import { Card } from '../../components/ui/card';
+import ConfirmationModal from '../../modals/ConfirmationModal';
+import { ActiveState } from '../../models/misc';
+import { selectToken } from '../../preferences/preferenceSlice';
+import type { AppDispatch, RootState } from '../../store';
+import { formatTokens } from '../../settings/traces/traceUtils';
+import {
+  formatDateOnly,
+  formatDateTime,
+  formatRelative,
+} from '../../utils/dateTimeUtils';
+import AgentPageToolbar, { LastUsedMeta } from '../components/AgentPageToolbar';
+import SectionShell from '../../navigation/SectionShell';
+import { ACTIVITY_SCHEDULES_PATH } from '../../activity/paths';
+import type {
+  Schedule,
+  ScheduleCreatePayload,
+  ScheduleRun,
+  ScheduleStats,
+} from '../types/schedule';
+import RunDetailDrawer from './RunDetailDrawer';
+import ScheduleFormModal from './ScheduleFormModal';
+import ScheduleRow from './ScheduleRow';
+import useScheduleAgentContext from './useScheduleAgentContext';
+import {
+  createSchedule,
+  deleteSchedule,
+  loadSchedulesForAgent,
+  runScheduleNow,
+  selectSchedulesForAgent,
+  selectSchedulesLoadError,
+  setSchedulePaused,
+  updateSchedule,
+} from './schedulesSlice';
+
+// Timezones and dates carry slashes: React escapes on render, so i18next
+// must not escape them first.
+const NO_ESCAPE = { interpolation: { escapeValue: false } } as const;
+
+// The stat row's window, in days.
+const STATS_DAYS = 30;
+
+/** Standalone Schedules page for an agent: list, create, edit, pause, run, delete. */
+export default function SchedulesView() {
+  const { t } = useTranslation();
+  const { agentId } = useParams();
+  const dispatch = useDispatch<AppDispatch>();
+  const token = useSelector(selectToken);
+
+  const { agent, loadingAgent, approvalTools } =
+    useScheduleAgentContext(agentId);
+  const [modalOpen, setModalOpen] = useState<boolean>(false);
+  const [editing, setEditing] = useState<Schedule | null>(null);
+  const [submitting, setSubmitting] = useState<boolean>(false);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [activeRun, setActiveRun] = useState<ScheduleRun | null>(null);
+  const [deleteConfirmation, setDeleteConfirmation] =
+    useState<ActiveState>('INACTIVE');
+  const [scheduleToDelete, setScheduleToDelete] = useState<Schedule | null>(
+    null,
+  );
+
+  const schedules = useSelector((state: RootState) =>
+    selectSchedulesForAgent(state, agentId ?? ''),
+  );
+  const loadError = useSelector((state: RootState) =>
+    selectSchedulesLoadError(state, agentId ?? ''),
+  );
+  // undefined while loading, null when the stats request failed.
+  const [stats, setStats] = useState<ScheduleStats | null | undefined>(
+    undefined,
+  );
+
+  // Refresh the totals whenever the list changes (a run finished, a
+  // schedule was paused or removed): the SSE feed updates `schedules`.
+  useEffect(() => {
+    if (!agentId) return;
+    let cancelled = false;
+    schedulesService
+      .statsForAgent(agentId, token, STATS_DAYS)
+      .then((next) => {
+        if (!cancelled) setStats(next);
+      })
+      .catch(() => {
+        if (!cancelled) setStats(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId, token, schedules]);
+
+  useEffect(() => {
+    if (!agentId) return;
+    dispatch(loadSchedulesForAgent({ agentId, token }));
+  }, [dispatch, agentId, token]);
+
+  const retryLoad = () => {
+    if (agentId) dispatch(loadSchedulesForAgent({ agentId, token }));
+  };
+
+  const recurring = useMemo(
+    () => schedules.filter((s) => s.trigger_type === 'recurring'),
+    [schedules],
+  );
+  const oneTime = useMemo(
+    () => schedules.filter((s) => s.trigger_type === 'once'),
+    [schedules],
+  );
+
+  const openCreate = () => {
+    setEditing(null);
+    setModalOpen(true);
+  };
+
+  const openEdit = (schedule: Schedule) => {
+    setEditing(schedule);
+    setModalOpen(true);
+  };
+
+  const closeModal = () => {
+    setModalOpen(false);
+    setEditing(null);
+  };
+
+  const requestDelete = (schedule: Schedule) => {
+    setScheduleToDelete(schedule);
+    setDeleteConfirmation('ACTIVE');
+  };
+
+  // Returned to ConfirmationModal: it stays pending while the delete runs,
+  // closes on success and keeps a failure in the dialog.
+  const confirmDelete = async () => {
+    if (!scheduleToDelete) return;
+    await dispatch(deleteSchedule({ id: scheduleToDelete.id, token })).unwrap();
+    setScheduleToDelete(null);
+  };
+
+  const handleSubmit = async (payload: ScheduleCreatePayload) => {
+    if (!agentId) return;
+    setSubmitting(true);
+    try {
+      if (editing?.id) {
+        await dispatch(
+          updateSchedule({ id: editing.id, payload, token }),
+        ).unwrap();
+      } else {
+        await dispatch(createSchedule({ agentId, payload, token })).unwrap();
+      }
+      setModalOpen(false);
+      setEditing(null);
+    } finally {
+      setSubmitting(false);
+    }
+    // A refused save rejects to the modal, which keeps it open and shows why.
+  };
+
+  const activeCount = schedules.filter((s) => s.status === 'active').length;
+  const pausedCount = schedules.filter((s) => s.status === 'paused').length;
+  const nextRunAt = schedules
+    .filter((s) => s.status === 'active' && s.next_run_at)
+    .map((s) => s.next_run_at as string)
+    .sort()[0];
+  // A next run in the past means the scheduler hasn't picked it up yet.
+  const nextRunOverdue =
+    Boolean(nextRunAt) && Date.parse(nextRunAt as string) < Date.now();
+  const statsLoading = stats === undefined;
+  const failedCount = stats?.failed ?? 0;
+  const latestFailure = stats?.latest_failure;
+
+  const newScheduleButton = (
+    <div className="flex flex-wrap gap-2">
+      <Button variant="outline" size="field" shape="pill" asChild>
+        <Link to={ACTIVITY_SCHEDULES_PATH}>
+          {t('agents.schedules.allSchedules')}
+        </Link>
+      </Button>
+      <Button type="button" size="field" shape="pill" onClick={openCreate}>
+        <Plus />
+        {t('agents.schedules.newRecurring')}
+      </Button>
+    </div>
+  );
+
+  const renderList = (list: Schedule[], emptyKey: string) =>
+    list.length === 0 ? (
+      <Card variant="subtle" padding="lg">
+        <EmptyState
+          size="sm"
+          illustration="none"
+          title={t(emptyKey)}
+          action={
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              shape="pill"
+              onClick={openCreate}
+            >
+              <Plus />
+              {t('agents.schedules.newRecurring')}
+            </Button>
+          }
+        />
+      </Card>
+    ) : (
+      <ul className="flex flex-col gap-3">
+        {list.map((schedule) => (
+          <li key={schedule.id}>
+            <ScheduleRow
+              schedule={schedule}
+              expanded={expanded === schedule.id}
+              onToggleRuns={(id) => setExpanded(expanded === id ? null : id)}
+              onEdit={openEdit}
+              onSetPaused={(target, paused) =>
+                dispatch(
+                  setSchedulePaused({
+                    id: target.id,
+                    action: paused ? 'pause' : 'resume',
+                    token,
+                  }),
+                )
+              }
+              onRunNow={(target) =>
+                dispatch(runScheduleNow({ id: target.id, token }))
+              }
+              onDelete={requestDelete}
+              onSelectRun={(run) => setActiveRun(run)}
+            />
+          </li>
+        ))}
+      </ul>
+    );
+
+  return (
+    <SectionShell>
+      {agent && (
+        <AgentPageToolbar
+          name={agent.name}
+          meta={<LastUsedMeta lastUsedAt={agent.last_used_at} />}
+          actions={newScheduleButton}
+        />
+      )}
+      {loadingAgent ? (
+        <LoadingState fill="block" />
+      ) : (
+        agent && (
+          <div className="flex flex-col gap-8">
+            <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
+              <StatCard
+                label={t('agents.schedules.stats.active')}
+                value={activeCount}
+                sub={
+                  pausedCount > 0
+                    ? t('agents.schedules.stats.paused', {
+                        count: pausedCount,
+                      })
+                    : undefined
+                }
+              />
+              <StatCard
+                label={t('agents.schedules.stats.nextRun')}
+                value={
+                  !nextRunAt
+                    ? '—'
+                    : nextRunOverdue
+                      ? t('agents.schedules.stats.overdue')
+                      : formatRelative(nextRunAt, { future: true })
+                }
+                valueTone={nextRunOverdue ? 'warning' : undefined}
+                sub={nextRunAt ? formatDateTime(nextRunAt) : undefined}
+              />
+              <StatCard
+                label={t('agents.schedules.stats.runs', { days: STATS_DAYS })}
+                value={stats ? stats.runs : '—'}
+                loading={statsLoading}
+                sub={
+                  stats
+                    ? t('agents.schedules.stats.tokens', {
+                        tokens: formatTokens(stats.tokens),
+                      })
+                    : undefined
+                }
+              />
+              <StatCard
+                label={t('agents.schedules.stats.failed', {
+                  days: STATS_DAYS,
+                })}
+                value={stats ? failedCount : '—'}
+                loading={statsLoading}
+                tone={failedCount > 0 ? 'destructive' : 'default'}
+                valueTone={failedCount > 0 ? 'destructive' : undefined}
+                sub={
+                  latestFailure
+                    ? t('agents.schedules.stats.latestFailure', {
+                        ...NO_ESCAPE,
+                        status: t(
+                          `agents.schedules.status.${latestFailure.status}`,
+                        ),
+                        date: formatDateOnly(latestFailure.scheduled_for),
+                      })
+                    : undefined
+                }
+              />
+            </div>
+            {loadError && (
+              <EmptyState
+                tone="destructive"
+                size="sm"
+                illustration="none"
+                title={t('agents.schedules.loadFailed')}
+                onRetry={retryLoad}
+              />
+            )}
+            {(!loadError || schedules.length > 0) && (
+              <Tabs defaultValue="recurring">
+                <TabsList>
+                  <TabsTrigger value="recurring">
+                    {t('agents.schedules.recurring')}
+                    <Badge variant="neutral">{recurring.length}</Badge>
+                  </TabsTrigger>
+                  <TabsTrigger value="once">
+                    {t('agents.schedules.oneTime')}
+                    <Badge variant="neutral">{oneTime.length}</Badge>
+                  </TabsTrigger>
+                </TabsList>
+                <TabsContent value="recurring" className="mt-4">
+                  {renderList(recurring, 'agents.schedules.noRecurring')}
+                </TabsContent>
+                <TabsContent value="once" className="mt-4">
+                  {renderList(oneTime, 'agents.schedules.noOneTime')}
+                </TabsContent>
+              </Tabs>
+            )}
+            <RunDetailDrawer
+              run={activeRun}
+              onClose={() => setActiveRun(null)}
+            />
+            {modalOpen && (
+              <ScheduleFormModal
+                key={editing?.id ?? 'create'}
+                open={modalOpen}
+                initial={editing}
+                approvalTools={approvalTools}
+                onClose={closeModal}
+                onSubmit={handleSubmit}
+                submitting={submitting}
+              />
+            )}
+            <ConfirmationModal
+              message={t('agents.schedules.deleteConfirm', {
+                interpolation: { escapeValue: false },
+                name:
+                  scheduleToDelete?.name ||
+                  scheduleToDelete?.instruction.slice(0, 80) ||
+                  '',
+              })}
+              description={t('agents.schedules.deleteConsequence')}
+              modalState={deleteConfirmation}
+              setModalState={setDeleteConfirmation}
+              submitLabel={t('agents.schedules.delete')}
+              handleSubmit={confirmDelete}
+              error={t('agents.schedules.deleteFailed')}
+              handleCancel={() => setScheduleToDelete(null)}
+              variant="destructive"
+            />
+          </div>
+        )
+      )}
+    </SectionShell>
+  );
+}

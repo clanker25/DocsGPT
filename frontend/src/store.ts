@@ -1,0 +1,111 @@
+import { configureStore } from '@reduxjs/toolkit';
+
+import activityReducer, {
+  activityListenerMiddleware,
+} from './activity/activitySlice';
+import agentPreviewReducer from './agents/agentPreviewSlice';
+import { MAX_OVERLAPPING, MAX_TOPICS } from './agents/analyticsConfig';
+import { backgroundListenerMiddleware } from './backgroundJobs/backgroundListener';
+import backgroundReducer from './backgroundJobs/backgroundSlice';
+import connectorsReducer from './connectors/connectorsSlice';
+import schedulesReducer from './agents/schedules/schedulesSlice';
+import workflowPreviewReducer from './agents/workflow/workflowPreviewSlice';
+import {
+  conversationListenerMiddleware,
+  conversationSlice,
+} from './conversation/conversationSlice';
+import { sharedConversationSlice } from './conversation/sharedConversationSlice';
+import actionToastReducer from './notifications/actionToastSlice';
+import notificationsReducer from './notifications/notificationsSlice';
+import { getStoredRecentDocs } from './preferences/preferenceApi';
+import {
+  Preference,
+  prefListenerMiddleware,
+  prefSlice,
+} from './preferences/preferenceSlice';
+import monitorsReducer from './monitors/monitorsSlice';
+import graphBuildReducer from './settings/graphBuildSlice';
+import teamsReducer from './teams/teamsSlice';
+import uploadReducer from './upload/uploadSlice';
+
+const key = localStorage.getItem('DocsGPTApiKey');
+const prompt = localStorage.getItem('DocsGPTPrompt');
+const chunks = localStorage.getItem('DocsGPTChunks');
+const selectedModel = localStorage.getItem('DocsGPTSelectedModel');
+
+const preloadedState: { preference: Preference } = {
+  preference: {
+    apiKey: key ?? '',
+    token: localStorage.getItem('authToken') ?? null,
+    prompt:
+      prompt !== null
+        ? JSON.parse(prompt)
+        : { name: 'default', id: 'default', type: 'private' },
+    prompts: [
+      { name: 'default', id: 'default', type: 'public' },
+      { name: 'creative', id: 'creative', type: 'public' },
+      { name: 'strict', id: 'strict', type: 'public' },
+    ],
+    chunks: JSON.parse(chunks ?? '6').toString(),
+    selectedDocs: getStoredRecentDocs(),
+    conversations: {
+      data: null,
+      loading: false,
+    },
+    sourceDocs: null,
+    modalState: 'INACTIVE',
+    paginatedDocuments: null,
+    templateAgents: null,
+    agents: null,
+    sharedAgents: null,
+    selectedAgent: null,
+    selectedModel: selectedModel ? JSON.parse(selectedModel) : null,
+    availableModels: [],
+    modelsLoading: false,
+    agentFolders: null,
+    roles: [],
+    rolesResolved: false,
+    ttsAvailable: true,
+    sttAvailable: true,
+    authRequired: false,
+    attachmentBudgetShare: null,
+    analyticsEnabled: false,
+    analyticsMaxTopics: MAX_TOPICS,
+    analyticsMaxOverlapping: MAX_OVERLAPPING,
+  },
+};
+const store = configureStore({
+  preloadedState: preloadedState,
+  reducer: {
+    preference: prefSlice.reducer,
+    conversation: conversationSlice.reducer,
+    sharedConversation: sharedConversationSlice.reducer,
+    upload: uploadReducer,
+    agentPreview: agentPreviewReducer,
+    workflowPreview: workflowPreviewReducer,
+    notifications: notificationsReducer,
+    actionToast: actionToastReducer,
+    schedules: schedulesReducer,
+    teams: teamsReducer,
+    graphBuild: graphBuildReducer,
+    connectors: connectorsReducer,
+    monitors: monitorsReducer,
+    background: backgroundReducer,
+    activity: activityReducer,
+  },
+  middleware: (getDefaultMiddleware) =>
+    getDefaultMiddleware().concat(
+      prefListenerMiddleware.middleware,
+      conversationListenerMiddleware.middleware,
+      backgroundListenerMiddleware.middleware,
+      activityListenerMiddleware.middleware,
+    ),
+});
+
+export type RootState = ReturnType<typeof store.getState>;
+export type AppDispatch = typeof store.dispatch;
+export default store;
+
+// TODO : use https://redux-toolkit.js.org/tutorials/typescript#define-typed-hooks everywere instead of direct useDispatch
+
+// TODO : streamline async state management

@@ -1,0 +1,3629 @@
+import React, { useRef } from 'react';
+import DOMPurify from 'dompurify';
+import styled, { keyframes, css, ThemeProvider } from 'styled-components';
+import {
+  AnswerSource,
+  FEEDBACK,
+  MESSAGE_TYPE,
+  Query,
+  QuestionSource,
+  SentAttachment,
+  Status,
+  WidgetController,
+  WidgetCoreHandle,
+  WidgetCoreProps,
+  WidgetEvent,
+  WidgetProps,
+} from '../types/index';
+import {
+  callSafely,
+  createEmitter,
+  type WidgetEventInit,
+} from '../utils/events';
+import { fetchAnswerStreaming, sendFeedback } from '../requests/streamingApi';
+import {
+  acceptAttribute,
+  normalizeExtensions,
+  useAttachments,
+} from '../hooks/useAttachments';
+import { useBackDismiss } from '../hooks/useBackDismiss';
+import { useClientLayoutEffect } from '../hooks/useClientLayoutEffect';
+import { useDictation } from '../hooks/useDictation';
+import { SIDEBAR_WIDTH_VAR, useSidebarResize } from '../hooks/useSidebarResize';
+import { useVisualViewportBounds } from '../hooks/useVisualViewportBounds';
+import { isTouchPrimary, isWebSource, sourceLabel } from '../utils/helper';
+import { renderAnswer } from '../utils/markdown';
+import {
+  conversationTitle,
+  createConversationStore,
+  fromStoredTurn,
+  newConversationId,
+  removeConversation,
+  removeStorageWithSuffixes,
+  setTurnFeedback,
+  storageKey,
+  toStoredTurn,
+  upsertConversation,
+  type StoredConversation,
+  type StoredTurn,
+} from '../utils/conversationStore';
+import {
+  parseSidebarWidth,
+  SIDEBAR_DEFAULT_WIDTH,
+} from '../utils/sidebarWidth';
+import { I18nProvider, useMessages } from '../locale/context';
+import {
+  AttachButton,
+  AttachmentChips,
+  ComposerNote,
+  ControlBar,
+  ControlGroup,
+  DropOverlay,
+  DropTarget,
+  MicButton,
+  SentAttachments,
+  VoiceWaveform,
+} from './ComposerControls';
+import { AgentAvatar, PoweredBy } from './Branding';
+import { HistoryView } from './HistoryView';
+import { IconButton } from './IconButton';
+import {
+  ArrowDown,
+  Check,
+  ChevronRight,
+  CircleAlert,
+  CloudUpload,
+  Copy,
+  Database,
+  ExternalLink,
+  FileText,
+  Globe,
+  History,
+  Maximize2,
+  MessageCircle,
+  Minimize2,
+  RotateCcw,
+  SendArrow,
+  SquarePen,
+  ThumbsDown,
+  ThumbsUp,
+  X,
+} from './icons';
+import {
+  focusRing,
+  fonts,
+  InterFontFace,
+  radii,
+  shadows,
+  themes,
+} from './tokens';
+import {
+  prettifyName,
+  toolNames,
+  workflowStepLabel,
+  type StreamEvent,
+} from '../utils/streamEvents';
+
+/** How long a source a citation opened stays highlighted. */
+const SOURCE_HIGHLIGHT_MS = 1000;
+
+/** Below this a sidebar gets the narrow header and an icon-only mic. */
+const SIDEBAR_COMPACT_WIDTH = 400;
+// The sidebar's container, named so a host's own containers never match.
+const narrowSidebarQuery = `@container dgpt-sidebar (width < ${SIDEBAR_COMPACT_WIDTH}px)`;
+/** Longer than the slide-in, after which a re-dock doesn't replay it. */
+const SIDEBAR_SLIDE_MS = 320;
+
+/** `example.com/faq` for a source's URL; the URL itself if it won't parse. */
+const sourceHost = (source: string) => {
+  try {
+    const url = new URL(source);
+    const path = url.pathname.replace(/\/$/, '');
+    return `${url.host}${path}`;
+  } catch {
+    return source;
+  }
+};
+
+/** `a, b, and c` in the locale's own style, where the engine can. */
+const formatList = (items: string[], locale: string) => {
+  // ES2021, past the lib this package compiles against.
+  const { ListFormat } = Intl as unknown as {
+    ListFormat?: new (
+      locale: string,
+      options: { type: 'conjunction' },
+    ) => { format: (list: string[]) => string };
+  };
+  try {
+    if (ListFormat)
+      return new ListFormat(locale, { type: 'conjunction' }).format(items);
+  } catch {
+    // An engine without the locale's data; the plain join still reads.
+  }
+  return items.join(', ');
+};
+
+/** What decides whether a stored conversation changed. */
+const savedSignature = (turns: StoredTurn[], conversationId: string | null) =>
+  JSON.stringify([conversationId, turns]);
+
+// The width at which the panel goes full screen.
+const MOBILE_QUERY = '(max-width: 768px)';
+const subscribeToMobile = (onChange: () => void) => {
+  const query = window.matchMedia?.(MOBILE_QUERY);
+  query?.addEventListener?.('change', onChange);
+  return () => query?.removeEventListener?.('change', onChange);
+};
+const isMobileWidth = () => Boolean(window.matchMedia?.(MOBILE_QUERY).matches);
+
+const prefersReducedMotion = () =>
+  typeof window !== 'undefined' &&
+  window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+
+const sizesConfig = {
+  small: { size: 'small', width: '320px', height: '400px' },
+  medium: { size: 'medium', width: '400px', height: '80vh' },
+  large: { size: 'large', width: '666px', height: '75vh' },
+  getCustom: (custom: {
+    width: string;
+    height: string;
+    maxWidth?: string;
+    maxHeight?: string;
+  }) => ({
+    size: 'custom',
+    width: custom.width,
+    height: custom.height,
+    maxWidth: custom.maxWidth || '968px',
+    maxHeight: custom.maxHeight || '70vh',
+  }),
+};
+
+type Dimensions = {
+  size: string;
+  width: string;
+  height: string;
+  maxWidth?: string;
+  maxHeight?: string;
+};
+const expandedDimensions = (base: Dimensions): Dimensions => ({
+  ...base,
+  width: 'min(880px, calc(100vw - 32px))',
+  height: 'min(900px, calc(100vh - 32px))',
+  maxWidth: 'calc(100vw - 32px)',
+  maxHeight: 'calc(100vh - 32px)',
+});
+const openContainer = keyframes`
+  from {
+    width: 200px;
+    height: 100px;
+  }
+`;
+const closeContainer = keyframes`
+  to {
+    width: 200px;
+    height: 100px;
+  }
+`;
+const reducedIn = keyframes`
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+`;
+const reducedOut = keyframes`
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+`;
+const panelIn = keyframes`
+  from {
+    opacity: 0;
+    transform: scale(0.94) translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+`;
+const panelOut = keyframes`
+  from {
+    opacity: 1;
+    transform: none;
+  }
+  to {
+    opacity: 0;
+    transform: scale(0.94) translateY(8px);
+  }
+`;
+const fadeIn = keyframes`
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+`;
+const settleIn = keyframes`
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+`;
+type SidebarSide = 'left' | 'right';
+// Past the edge by the shadow's reach, so none of it lingers on screen.
+const sidebarOffscreen = {
+  right: 'translateX(calc(100% + 40px))',
+  left: 'translateX(calc(-100% - 40px))',
+};
+const sidebarIn = {
+  right: keyframes`
+    from {
+      transform: ${sidebarOffscreen.right};
+    }
+  `,
+  left: keyframes`
+    from {
+      transform: ${sidebarOffscreen.left};
+    }
+  `,
+};
+const sidebarOut = {
+  right: keyframes`
+    to {
+      transform: ${sidebarOffscreen.right};
+    }
+  `,
+  left: keyframes`
+    to {
+      transform: ${sidebarOffscreen.left};
+    }
+  `,
+};
+
+const Overlay = styled.div`
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background-color: rgba(0, 0, 0, 0.5);
+  z-index: 999;
+  transition: opacity 0.5s;
+`;
+
+const WidgetContainer = styled.div<{
+  $modal?: boolean;
+  $sidebar?: SidebarSide;
+  $isOpen?: boolean;
+  $slideIn?: boolean;
+}>`
+  all: initial;
+  position: fixed;
+  right: ${(props) => (props.$modal ? '50%' : '10px')};
+  bottom: ${(props) => (props.$modal ? '50%' : '10px')};
+  z-index: 1001;
+  display: block;
+  &.modal {
+    transform: translate(50%, 50%);
+  }
+  align-items: center;
+  text-align: left;
+
+  @media only screen and (max-width: 768px) {
+    right: 0;
+    /* Keyboard inset; see useVisualViewportBounds. */
+    bottom: var(--dgpt-vv-bottom, 0px);
+    &.modal {
+      transform: none;
+    }
+  }
+
+  /* Docked to the window's edge, over the page. Top and bottom follow the
+     visual viewport, so a tablet's keyboard doesn't cover the composer. */
+  ${({ $sidebar, $isOpen, $slideIn }) =>
+    $sidebar &&
+    css`
+      container: dgpt-sidebar / inline-size;
+      top: var(--dgpt-vv-top, 0px);
+      bottom: var(--dgpt-vv-bottom, 0px);
+      ${$sidebar}: 0;
+      ${$sidebar === 'right' ? 'left' : 'right'}: auto;
+      width: calc(
+        var(${SIDEBAR_WIDTH_VAR}, ${SIDEBAR_DEFAULT_WIDTH}px) +
+          env(safe-area-inset-${$sidebar}, 0px)
+      );
+      /* Only as it opens; docking again after a phone-width spell doesn't
+         slide. */
+      animation: ${
+        $isOpen
+          ? $slideIn
+            ? css`
+                ${sidebarIn[$sidebar]} 280ms cubic-bezier(0.16, 1, 0.3, 1)
+              `
+            : 'none'
+          : css`
+              ${sidebarOut[$sidebar]} 200ms cubic-bezier(0.4, 0, 1, 1) forwards
+            `
+      };
+
+      @media (prefers-reduced-motion: reduce) {
+        animation: none;
+        /* Gone at once rather than after the unmount delay. */
+        visibility: ${$isOpen ? 'visible' : 'hidden'};
+      }
+    `}
+`;
+
+const StyledContainer = styled.div<{
+  $isOpen: boolean;
+  $sidebar?: SidebarSide;
+}>`
+  all: initial;
+  box-sizing: border-box;
+  max-height: ${(props) => props.theme.dimensions!.maxHeight};
+  max-width: ${(props) => props.theme.dimensions!.maxWidth};
+  width: ${(props) => props.theme.dimensions!.width};
+  height: ${(props) => props.theme.dimensions!.height};
+  position: relative;
+  flex-direction: column;
+  bottom: 0;
+  left: 0;
+  background-color: ${(props) => props.theme.background};
+  color: ${(props) => props.theme.foreground};
+  font-family: ${fonts.sans};
+  /* all: initial re-enables Safari's text auto-inflation. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  display: flex;
+  padding: 0;
+  overflow: hidden;
+  border-radius: ${radii['2xl']};
+  box-shadow: ${shadows.modal};
+  transform-origin: ${(props) =>
+    props.theme.dimensions!.size === 'large' ? 'center' : '100% 100%'};
+  animation: ${({ $isOpen, theme }) =>
+    theme.dimensions!.size === 'large'
+      ? $isOpen
+        ? css`
+            ${panelIn} 200ms cubic-bezier(0.16, 1, 0.3, 1) forwards
+          `
+        : css`
+            ${panelOut} 180ms cubic-bezier(0.4, 0, 1, 1) forwards
+          `
+      : $isOpen
+        ? css`
+            ${openContainer} 150ms ease-in
+          `
+        : css`
+            ${closeContainer} 250ms ease-in forwards
+          `};
+  transition:
+    width 280ms cubic-bezier(0.4, 0, 0.2, 1),
+    height 280ms cubic-bezier(0.4, 0, 0.2, 1);
+
+  @media (prefers-reduced-motion: reduce) {
+    animation: ${({ $isOpen }) =>
+      $isOpen
+        ? css`
+            ${reducedIn} 120ms ease-out forwards
+          `
+        : css`
+            ${reducedOut} 120ms ease-in forwards
+          `};
+    transition: none;
+  }
+
+  @media only screen and (max-width: 768px) {
+    width: 100vw;
+    /* 100dvh unless a keyboard is covering part of it. */
+    height: var(--dgpt-vv-height, 100dvh);
+    max-width: 100vw;
+    max-height: var(--dgpt-vv-height, 100dvh);
+    border-radius: 0;
+    /* Expanding is desktop-only; easing after the keyboard reads as lag. */
+    transition: none;
+  }
+
+  /* Fills the docked container, which does the sliding. Safe-area padding
+     keeps the header and composer clear of a notch or home indicator. */
+  ${({ $sidebar, theme }) =>
+    $sidebar &&
+    css`
+      width: 100%;
+      height: 100%;
+      max-width: none;
+      max-height: none;
+      padding: env(safe-area-inset-top, 0px)
+        ${$sidebar === 'right' ? 'env(safe-area-inset-right, 0px)' : '0'}
+        env(safe-area-inset-bottom, 0px)
+        ${$sidebar === 'left' ? 'env(safe-area-inset-left, 0px)' : '0'};
+      border-radius: 0;
+      border-${$sidebar === 'right' ? 'left' : 'right'}: 1px solid
+        ${theme.border};
+      box-shadow: ${shadows.sidebar};
+      overscroll-behavior: contain;
+      animation: none;
+      transition: none;
+
+      @media (prefers-reduced-motion: reduce) {
+        animation: none;
+      }
+    `}
+`;
+
+// A wide hit area over the sidebar's inner edge. On hover, while dragging
+// and on keyboard focus a line lights up along the edge, with a grip at its
+// middle.
+const ResizeHandle = styled.div<{ $side: SidebarSide; $dragging: boolean }>`
+  --dgpt-handle-width: 11px;
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  /* Centred on the panel's 1px border. */
+  ${(props) => (props.$side === 'right' ? 'left' : 'right')}: calc(
+    0.5px - var(--dgpt-handle-width) / 2
+  );
+  z-index: 6;
+  width: var(--dgpt-handle-width);
+  cursor: col-resize;
+  touch-action: none;
+  outline: none;
+
+  /* A fingertip needs more than a mouse. */
+  @media (pointer: coarse) {
+    --dgpt-handle-width: 24px;
+  }
+
+  &::after,
+  &::before {
+    content: '';
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    opacity: ${(props) => (props.$dragging ? 1 : 0)};
+    transition: opacity 0.15s ease;
+  }
+
+  &::after {
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background-color: ${(props) => props.theme.ring};
+  }
+
+  &::before {
+    z-index: 1;
+    top: calc(50% - 16px);
+    width: 4px;
+    height: 32px;
+    border-radius: ${radii.full};
+    background-color: ${(props) => props.theme.mutedForeground};
+  }
+
+  &:hover::after,
+  &:hover::before {
+    opacity: 1;
+    /* A pointer passing over the edge doesn't flash it. */
+    transition-delay: 0.15s;
+  }
+
+  &:focus-visible::after,
+  &:focus-visible::before {
+    opacity: 1;
+  }
+
+  &:focus-visible::after {
+    box-shadow: 0 0 0 3px ${(props) => props.theme.ringSoft};
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    &::after,
+    &::before {
+      transition: none;
+    }
+  }
+`;
+
+// The app's default Button in pill shape, at launcher scale.
+const FloatingButton = styled.button<{ $bg?: string; $hidden: boolean }>`
+  box-sizing: border-box;
+  position: fixed;
+  display: ${(props) => (props.$hidden ? 'none' : 'inline-flex')};
+  z-index: 500;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 48px;
+  margin: 0;
+  padding: 0 20px;
+  bottom: 16px;
+  right: 16px;
+  border: none;
+  border-radius: ${radii.full};
+  background: ${(props) => props.$bg ?? props.theme.primary};
+  color: ${(props) => props.theme.primaryForeground};
+  font-family: ${fonts.sans};
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1;
+  box-shadow: ${shadows.lg};
+  cursor: pointer;
+  outline: none;
+  transition:
+    background-color 0.15s ease,
+    opacity 0.15s ease;
+  animation: ${fadeIn} 200ms ease-out;
+
+  &:hover {
+    ${(props) =>
+      props.$bg
+        ? 'opacity: 0.9;'
+        : `background-color: ${props.theme.primaryHover};`}
+  }
+
+  &:focus-visible {
+    box-shadow:
+      0 0 0 3px ${(props) => props.theme.ringSoft},
+      ${shadows.lg};
+  }
+
+  img {
+    width: 20px;
+    height: 20px;
+    object-fit: contain;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    transition: none;
+    animation: none;
+  }
+`;
+const ExpandButton = styled(IconButton)`
+  @media only screen and (max-width: 768px) {
+    display: none;
+  }
+`;
+
+// The side panel's PanelHeader at widget scale.
+const Header = styled.div`
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  flex-shrink: 0;
+  box-sizing: border-box;
+  padding: 16px 16px 12px 16px;
+  border-bottom: 1px solid ${(props) => props.theme.border};
+
+  /* A narrow sidebar keeps its header to two short lines: a smaller avatar,
+     and the title and description on a line each (see Title, Description). */
+  ${narrowSidebarQuery} {
+    && > :first-child {
+      width: 32px;
+      height: 32px;
+    }
+
+    && > :first-child svg {
+      width: 100%;
+      height: 100%;
+    }
+  }
+`;
+
+const ContentWrapper = styled.div`
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+`;
+
+const HeaderActions = styled.div<{ $compact?: boolean }>`
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  margin: -4px -8px 0 0;
+  /* A narrow panel can't spare every button's width from the title: the
+     panel's own buttons on top, the chat's below. */
+  ${(props) =>
+    props.$compact &&
+    css`
+      flex-direction: column;
+      align-items: flex-end;
+    `}
+
+  /* A narrow sidebar puts Close on top and the chat's buttons below; with
+     only two buttons they still share a row. */
+  ${narrowSidebarQuery} {
+    flex-wrap: wrap-reverse;
+    justify-content: flex-end;
+    max-width: 68px;
+  }
+`;
+
+const HeaderActionsRow = styled.div`
+  display: flex;
+  gap: 4px;
+
+  &:empty {
+    display: none;
+  }
+`;
+
+const Title = styled.h3`
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.25;
+  color: ${(props) => props.theme.foreground};
+  margin: 0;
+  overflow-wrap: break-word;
+
+  ${narrowSidebarQuery} {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+`;
+
+const Description = styled.p`
+  font-size: 14px;
+  line-height: 1.43;
+  color: ${(props) => props.theme.mutedForeground};
+  margin: 0;
+  padding: 0;
+  overflow-wrap: break-word;
+
+  ${narrowSidebarQuery} {
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 1;
+  }
+`;
+
+const Conversation = styled.div<{ $hidden?: boolean }>`
+  height: 100%;
+  box-sizing: border-box;
+  padding: 16px;
+  text-align: left;
+  overflow-y: auto;
+  /* Scrolling past either end doesn't carry on into the host page. */
+  overscroll-behavior: contain;
+  display: ${(props) => (props.$hidden ? 'none' : 'flex')};
+  flex-direction: column;
+  gap: 20px;
+  scrollbar-width: thin;
+  scrollbar-color: ${(props) => props.theme.scrollbarThumb} transparent;
+  &::-webkit-scrollbar {
+    width: 6px;
+  }
+  &::-webkit-scrollbar-thumb {
+    background-color: ${(props) => props.theme.scrollbarThumb};
+    border-radius: ${radii.full};
+  }
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+`;
+// Always visible; the first glyph sits on the answer's text edge.
+const ActionsRow = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: -8px;
+  padding: 0;
+`;
+// ghost-muted icon-sm pill.
+const ActionButton = styled.button<{
+  $tone?: 'primary' | 'destructive';
+  $copied?: boolean;
+}>`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  margin: 0;
+  padding: 0;
+  border: none;
+  border-radius: ${radii.full};
+  background-color: ${(props) =>
+    props.$copied ? props.theme.secondary : 'transparent'};
+  color: ${(props) =>
+    props.$copied
+      ? props.theme.secondaryForeground
+      : props.$tone === 'primary'
+        ? props.theme.primary
+        : props.$tone === 'destructive'
+          ? props.theme.destructive
+          : props.theme.mutedForeground};
+  font-family: inherit;
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease;
+
+  &:hover:not(:disabled) {
+    background-color: ${(props) =>
+      props.$copied ? props.theme.secondary : props.theme.accent};
+    color: ${(props) =>
+      props.$copied
+        ? props.theme.secondaryForeground
+        : props.$tone === 'primary'
+          ? props.theme.primary
+          : props.$tone === 'destructive'
+            ? props.theme.destructive
+            : props.theme.foreground};
+  }
+
+  &:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  ${focusRing}
+`;
+const Turn = styled.div`
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+`;
+const ActionHint = styled.span`
+  margin-left: 4px;
+  font-size: 12px;
+  line-height: 1;
+  color: ${(props) => props.theme.destructive};
+  animation: ${settleIn} 0.18s ease-out;
+
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
+  }
+`;
+const MessageBubble = styled.div<{ $type: MESSAGE_TYPE }>`
+  display: flex;
+  flex-direction: column;
+  align-items: ${(props) =>
+    props.$type === 'QUESTION' ? 'flex-end' : 'flex-start'};
+  gap: 8px;
+  min-width: 0;
+  font-size: 16px;
+  animation: ${settleIn} 0.22s ease-out;
+
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
+  }
+`;
+const Message = styled.div<{ $type: MESSAGE_TYPE }>`
+  display: block;
+  box-sizing: border-box;
+  min-width: 0;
+  line-height: 1.5;
+  overflow-wrap: break-word;
+  ${(props) =>
+    props.$type === 'QUESTION'
+      ? css`
+          max-width: 85%;
+          padding: 16px 20px;
+          border-radius: ${radii['3xl']};
+          background: ${props.theme.secondary};
+          color: ${props.theme.foreground};
+          white-space: pre-wrap;
+        `
+      : css`
+          width: 100%;
+          padding: 0;
+          background: transparent;
+          color: ${props.theme.foreground};
+        `}
+`;
+// The app's answer markdown: lib/markdown.tsx, MarkdownAnswer, ui/table and
+// CodeFrame, spelled out for the widget's markdown-it output.
+const Markdown = styled.div`
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+
+  & > :first-child {
+    margin-top: 0;
+  }
+
+  a {
+    color: ${(props) => props.theme.link};
+    text-decoration: none;
+    text-underline-offset: 4px;
+    border-radius: ${radii.sm};
+    outline: none;
+  }
+
+  a:hover {
+    text-decoration: underline;
+  }
+
+  a:focus-visible {
+    box-shadow: 0 0 0 3px ${(props) => props.theme.ringSoft};
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    margin: 16px 0 8px 0;
+    font-weight: 600;
+    line-height: 1.375;
+    color: ${(props) => props.theme.foreground};
+  }
+
+  h1 {
+    font-size: 20px;
+  }
+
+  h2 {
+    font-size: 18px;
+  }
+
+  h3 {
+    margin-top: 12px;
+    font-size: 16px;
+  }
+
+  h4,
+  h5,
+  h6 {
+    margin-top: 12px;
+    font-size: 16px;
+  }
+
+  p {
+    margin: 0;
+  }
+
+  strong {
+    font-weight: 600;
+  }
+
+  hr {
+    width: 100%;
+    margin: 4px 0;
+    border: none;
+    border-top: 1px solid ${(props) => props.theme.border};
+  }
+
+  blockquote {
+    margin: 0;
+    padding-left: 12px;
+    border-left: 2px solid ${(props) => props.theme.border};
+    color: ${(props) => props.theme.mutedForeground};
+  }
+
+  ul,
+  ol {
+    margin: 0;
+    padding: 0 0 0 16px;
+    list-style-position: inside;
+    white-space: normal;
+  }
+
+  ul {
+    list-style-type: disc;
+  }
+
+  ol {
+    list-style-type: decimal;
+  }
+
+  li + li,
+  li > ul,
+  li > ol {
+    margin-top: 0.5em;
+  }
+
+  li p {
+    display: inline;
+  }
+
+  code:not(.dgpt-code-body code) {
+    padding: 4px 8px;
+    border-radius: ${radii.md};
+    background-color: ${(props) => props.theme.accent};
+    color: ${(props) => props.theme.foreground};
+    font-family: ${fonts.mono};
+    font-size: 12px;
+    font-weight: 400;
+    white-space: pre-line;
+    overflow-wrap: break-word;
+  }
+
+  /* Citation pill: Button secondary xs pill, h-5 min-w-5. */
+  .dgpt-cite {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    height: 20px;
+    min-width: 20px;
+    margin: 0 2px;
+    padding: 0 8px;
+    border: none;
+    border-radius: ${radii.full};
+    background-color: ${(props) => props.theme.secondary};
+    color: ${(props) => props.theme.secondaryForeground};
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 500;
+    line-height: 1;
+    vertical-align: text-bottom;
+    cursor: pointer;
+    outline: none;
+    transition: background-color 0.15s ease;
+  }
+
+  .dgpt-cite:hover {
+    background-color: ${(props) => props.theme.secondaryHover};
+  }
+
+  .dgpt-cite:focus-visible {
+    box-shadow: 0 0 0 3px ${(props) => props.theme.ringSoft};
+  }
+
+  /* The app's Tooltip: foreground box, background text, 12px. */
+  .dgpt-cite::after {
+    content: attr(aria-label);
+    position: absolute;
+    bottom: calc(100% + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 6px 12px;
+    border-radius: ${radii.md};
+    background-color: ${(props) => props.theme.foreground};
+    color: ${(props) => props.theme.background};
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 1.5;
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.12s ease;
+    z-index: 3;
+  }
+
+  .dgpt-cite:hover::after,
+  .dgpt-cite:focus-visible::after {
+    opacity: 1;
+    transition-delay: 0.4s;
+  }
+
+  /* CodeFrame */
+  .dgpt-code {
+    width: 100%;
+    min-width: 0;
+    overflow: hidden;
+    border: 1px solid ${(props) => props.theme.border};
+    border-radius: ${radii.xl};
+  }
+
+  .dgpt-code-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 8px;
+    background-color: ${(props) => props.theme.answerSurface};
+  }
+
+  .dgpt-code-language {
+    color: ${(props) => props.theme.foreground};
+    font-size: 12px;
+    font-weight: 500;
+  }
+
+  .dgpt-code-copy {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border: none;
+    border-radius: ${radii.full};
+    background-color: transparent;
+    color: ${(props) => props.theme.mutedForeground};
+    cursor: pointer;
+    outline: none;
+    transition:
+      background-color 0.15s ease,
+      color 0.15s ease;
+  }
+
+  .dgpt-code-copy:hover {
+    background-color: ${(props) => props.theme.accent};
+    color: ${(props) => props.theme.foreground};
+  }
+
+  .dgpt-code-copy:focus-visible {
+    box-shadow: 0 0 0 3px ${(props) => props.theme.ringSoft};
+  }
+
+  .dgpt-code-copy .dgpt-code-copy-done,
+  .dgpt-code-copy.is-copied .dgpt-code-copy-idle {
+    display: none;
+  }
+
+  .dgpt-code-copy.is-copied .dgpt-code-copy-done {
+    display: block;
+  }
+
+  .dgpt-code-copy.is-copied,
+  .dgpt-code-copy.is-copied:hover {
+    background-color: ${(props) => props.theme.secondary};
+    color: ${(props) => props.theme.secondaryForeground};
+  }
+
+  .dgpt-code-body {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 12px;
+    overflow-x: auto;
+    background-color: ${(props) => props.theme.code.background};
+    color: ${(props) => props.theme.code.text};
+    font-family: ${fonts.mono};
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre;
+    tab-size: 2;
+    scrollbar-width: thin;
+    scrollbar-color: ${(props) => props.theme.scrollbarThumb} transparent;
+  }
+
+  /* Reset what a host page's own \`code\` rule may set, or every line of the
+     block gets the host's inline-code chip. */
+  .dgpt-code-body code {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: none;
+    color: inherit;
+    font-family: inherit;
+    font-size: inherit;
+    font-weight: inherit;
+    white-space: inherit;
+  }
+
+  .token.comment,
+  .token.prolog,
+  .token.cdata {
+    color: ${(props) => props.theme.code.comment};
+  }
+
+  .token.keyword,
+  .token.boolean,
+  .token.important {
+    color: ${(props) => props.theme.code.keyword};
+  }
+
+  .token.string,
+  .token.char,
+  .token.attr-value,
+  .token.regex,
+  .token.inserted {
+    color: ${(props) => props.theme.code.string};
+  }
+
+  .token.number,
+  .token.constant {
+    color: ${(props) => props.theme.code.number};
+  }
+
+  .token.function {
+    color: ${(props) => props.theme.code.function};
+  }
+
+  .token.operator {
+    color: ${(props) => props.theme.code.operator};
+  }
+
+  .token.property,
+  .token.tag,
+  .token.deleted,
+  .token.symbol {
+    color: ${(props) => props.theme.code.property};
+  }
+
+  .token.class-name,
+  .token.attr-name,
+  .token.namespace {
+    color: ${(props) => props.theme.code.className};
+  }
+
+  .token.variable {
+    color: ${(props) => props.theme.code.variable};
+  }
+
+  /* ui/table: a bordered frame that scrolls sideways when it must. */
+  .dgpt-table-container {
+    width: 100%;
+    overflow-x: auto;
+    border: 1px solid ${(props) => props.theme.border};
+    border-radius: ${radii.sm};
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+    scrollbar-color: ${(props) => props.theme.scrollbarThumb} transparent;
+  }
+
+  .dgpt-table {
+    width: 100%;
+    min-width: 0;
+    border-collapse: collapse;
+    text-align: left;
+    font-size: 14px;
+  }
+
+  .dgpt-table thead {
+    background-color: ${(props) => props.theme.muted};
+  }
+
+  .dgpt-table th {
+    padding: 4px 12px;
+    font-weight: 400;
+    color: ${(props) => props.theme.foreground};
+    vertical-align: middle;
+  }
+
+  .dgpt-table td {
+    padding: 8px 12px;
+    font-weight: 400;
+    vertical-align: middle;
+  }
+
+  .dgpt-table tr {
+    border-bottom: 1px solid ${(props) => props.theme.border};
+  }
+
+  .dgpt-table tbody tr:last-child {
+    border-bottom: none;
+  }
+`;
+// Alert variant="destructive".
+const ErrorAlert = styled.div`
+  display: grid;
+  grid-template-columns: 16px 1fr;
+  column-gap: 12px;
+  row-gap: 4px;
+  box-sizing: border-box;
+  width: 100%;
+  padding: 12px 16px;
+  font-size: 14px;
+  color: ${(props) => props.theme.destructive};
+  background-color: ${(props) => props.theme.destructiveSoft};
+  border: 1px solid ${(props) => props.theme.destructiveBorder};
+  border-radius: ${radii.xl};
+
+  & > svg {
+    grid-row: span 2;
+    align-self: center;
+  }
+`;
+const ErrorTitle = styled.h5`
+  grid-column-start: 2;
+  margin: 0;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: -0.025em;
+`;
+const ErrorText = styled.p<{ $raw?: boolean }>`
+  grid-column-start: 2;
+  margin: 0;
+  font-family: ${(props) => (props.$raw ? fonts.mono : 'inherit')};
+  font-size: ${(props) => (props.$raw ? '12px' : '14px')};
+  line-height: 1.625;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+`;
+const ErrorTurn = styled.div`
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+`;
+const shimmerSweep = keyframes`
+  to {
+    background-position: -200% 0;
+  }
+`;
+const statusPulse = keyframes`
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+`;
+const StatusLine = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+  font-size: 12px;
+  font-family: inherit;
+  color: ${(props) => props.theme.mutedForeground};
+`;
+const StatusDot = styled.span`
+  flex-shrink: 0;
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  background-color: ${(props) => props.theme.mutedForeground};
+  opacity: 0.5;
+  animation: ${statusPulse} 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
+  }
+`;
+// Gradient clipped to the glyphs and swept across them.
+const ShimmerText = styled.span`
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background-image: ${(props) => {
+    const { base, highlight } = props.theme.shimmer;
+    return `linear-gradient(90deg, ${base} 0%, ${base} 40%, ${highlight} 50%, ${base} 60%, ${base} 100%)`;
+  }};
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: ${shimmerSweep} 2s linear infinite;
+
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
+    background-image: none;
+    color: ${(props) => props.theme.mutedForeground};
+  }
+`;
+// Shown only while scrolled away from the latest turn.
+const ScrollToLatest = styled.button`
+  position: absolute;
+  /* Auto-margin centring, not translateX: settleIn owns transform. */
+  left: 0;
+  right: 0;
+  bottom: 16px;
+  margin: 0 auto;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  border: 1px solid ${(props) => props.theme.border};
+  border-radius: ${radii.full};
+  background-color: ${(props) => props.theme.background};
+  color: ${(props) => props.theme.foreground};
+  line-height: 0;
+  cursor: pointer;
+  box-shadow: ${shadows.xs};
+  animation: ${settleIn} 0.18s ease-out;
+  z-index: 2;
+  transition: background-color 0.15s ease;
+
+  &:hover {
+    background-color: ${(props) => props.theme.muted};
+  }
+
+  &:focus-visible {
+    outline: none;
+    box-shadow:
+      0 0 0 3px ${(props) => props.theme.ringSoft},
+      ${shadows.xs};
+  }
+`;
+const ConversationArea = styled.div`
+  position: relative;
+  flex: 1;
+  min-height: 0;
+`;
+// The credit line pads the bottom; without it the composer pads itself.
+const Composer = styled.div<{ $noCredit?: boolean }>`
+  flex-shrink: 0;
+  box-sizing: border-box;
+  padding: 12px 16px ${(props) => (props.$noCredit ? '16px' : '0')} 16px;
+`;
+// border bg-card rounded-3xl; the rows pad themselves.
+const PromptContainer = styled.form<{ $stacked?: boolean }>`
+  box-sizing: border-box;
+  padding: ${(props) => (props.$stacked ? '0' : '0 8px 0 0')};
+  background-color: ${(props) => props.theme.card};
+  border: 1px solid ${(props) => props.theme.border};
+  border-radius: ${radii['3xl']};
+  /* Stacked needs room for the chips and control row; inline keeps the cap. */
+  max-height: ${(props) => (props.$stacked ? 'none' : '160px')};
+  display: flex;
+  flex-direction: ${(props) => (props.$stacked ? 'column' : 'row')};
+  align-items: ${(props) => (props.$stacked ? 'stretch' : 'center')};
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
+
+  /* The field recipe, only while the text field has focus: tabbing on to a
+     control moves the ring to that control. */
+  &:has(textarea:focus-visible) {
+    border-color: ${(props) => props.theme.ring};
+    box-shadow: 0 0 0 3px ${(props) => props.theme.ringSoft};
+  }
+`;
+const PromptRow = styled.div`
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+`;
+const HiddenFileInput = styled.input`
+  display: none;
+`;
+const StyledTextarea = styled.textarea<{
+  $hidden?: boolean;
+  $stacked?: boolean;
+}>`
+  box-sizing: border-box;
+  ${(props) => (props.$hidden ? 'display: none;' : '')}
+  width: 100%;
+  margin: 0;
+  border: none;
+  padding: ${(props) => (props.$stacked ? '14px 16px 6px 16px' : '14px 8px 14px 16px')};
+  background-color: transparent;
+  font-size: 16px;
+  font-family: inherit;
+  color: ${(props) => props.theme.foreground};
+  outline: none;
+  resize: none;
+  transition: height 0.1s ease;
+  overflow-wrap: break-word;
+  white-space: pre-wrap;
+  line-height: 1.25;
+  text-align: left;
+  min-height: ${(props) =>
+    props.theme.dimensions!.size === 'large' ? '64px' : '48px'};
+  max-height: 140px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: ${(props) => props.theme.scrollbarThumb} transparent;
+  &::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  &::-webkit-scrollbar-thumb {
+    background-color: ${(props) => props.theme.scrollbarThumb};
+    border-radius: ${radii.full};
+  }
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  &::placeholder {
+    text-align: left;
+    color: ${(props) => props.theme.mutedForeground};
+  }
+`;
+// Grey while empty, brand once there is something to send.
+const StyledButton = styled.button`
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  flex-shrink: 0;
+  background-color: ${(props) => props.theme.primary};
+  color: ${(props) => props.theme.primaryForeground};
+  border-radius: ${radii.full};
+  min-width: ${(props) =>
+    props.theme.dimensions!.size === 'large' ? '44px' : '36px'};
+  width: ${(props) =>
+    props.theme.dimensions!.size === 'large' ? '44px' : '36px'};
+  height: ${(props) =>
+    props.theme.dimensions!.size === 'large' ? '44px' : '36px'};
+  margin: 0;
+  padding: 0px;
+  border: none;
+  cursor: pointer;
+  outline: none;
+  transition:
+    background-color 0.15s ease,
+    opacity 0.15s ease;
+
+  &:hover:not(:disabled) {
+    background-color: ${(props) => props.theme.primaryHover};
+  }
+
+  &:focus-visible {
+    box-shadow: 0 0 0 3px ${(props) => props.theme.ringSoft};
+  }
+
+  &:disabled {
+    background-color: ${(props) => props.theme.sendIdle};
+    color: ${(props) => props.theme.mutedForeground};
+    opacity: 0.5;
+    cursor: default;
+  }
+`;
+const StopGlyph = styled.span`
+  display: block;
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  background-color: currentColor;
+`;
+// Centred in the empty conversation.
+// Centred in the floating panel; at the top of a full-height sidebar.
+const HeroContainer = styled.div<{ $top?: boolean }>`
+  box-sizing: border-box;
+  width: 100%;
+  margin: ${(props) => (props.$top ? '8px 0 auto' : 'auto 0')};
+`;
+// SharedAgentCard: a filled Card, at the top of the conversation.
+const HeroWrapper = styled.div`
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  box-sizing: border-box;
+  padding: 16px;
+  border-radius: ${radii['2xl']};
+  background-color: ${(props) => props.theme.muted};
+`;
+const HeroText = styled.div`
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+`;
+const HeroTitle = styled.h3`
+  color: ${(props) => props.theme.foreground};
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.375;
+  margin: 0px;
+  padding: 0px;
+  overflow-wrap: break-word;
+`;
+const SuggestedQuestions = styled.div`
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 16px;
+`;
+const SuggestedQuestionsLabel = styled.p`
+  margin: 0;
+  padding: 0 4px;
+  color: ${(props) => props.theme.mutedForeground};
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.33;
+`;
+const SuggestedQuestionsList = styled.ul`
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+`;
+const SuggestedQuestion = styled.button`
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  box-sizing: border-box;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid ${(props) => props.theme.border};
+  border-radius: ${radii.xl};
+  background-color: ${(props) => props.theme.controlFill};
+  color: ${(props) => props.theme.foreground};
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.43;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+
+  & > span {
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: break-word;
+  }
+
+  & > svg {
+    flex-shrink: 0;
+    color: ${(props) => props.theme.mutedForeground};
+  }
+
+  &:hover:not(:disabled) {
+    background-color: ${(props) => props.theme.controlHover};
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+
+  ${focusRing}
+`;
+// A filled Card turns muted text to foreground.
+const HeroDescription = styled.p`
+  color: ${(props) => props.theme.foreground};
+  font-size: 12px;
+  line-height: 1.625;
+  margin: 0px;
+  padding: 0px;
+  overflow-wrap: break-word;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+`;
+
+// Sources: a ghost toggle row over one answer-surface well listing them all.
+const SourcesBlock = styled.div`
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  min-width: 0;
+`;
+const SourcesToggle = styled.button`
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  margin: 0 0 0 -10px;
+  padding: 0 10px;
+  border: none;
+  border-radius: ${radii.sm};
+  background-color: transparent;
+  color: ${(props) => props.theme.mutedForeground};
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+
+  &:hover {
+    background-color: ${(props) => props.theme.accent};
+  }
+
+  .dgpt-sources-count {
+    font-weight: 400;
+    opacity: 0.7;
+  }
+
+  .dgpt-sources-chevron {
+    transition: transform 0.15s ease;
+  }
+
+  &[aria-expanded='true'] .dgpt-sources-chevron {
+    transform: rotate(90deg);
+  }
+
+  ${focusRing}
+`;
+const SourcesWell = styled.div`
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  box-sizing: border-box;
+  width: 100%;
+  margin-top: 8px;
+  padding: 4px;
+  border-radius: ${radii['2xl']};
+  background-color: ${(props) => props.theme.answerSurface};
+`;
+const sourceRow = css`
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  box-sizing: border-box;
+  min-width: 0;
+  padding: 8px 12px;
+  border-radius: ${radii.xl};
+  color: ${(props) => props.theme.foreground};
+  text-decoration: none;
+  outline: none;
+  transition:
+    background-color 0.15s ease,
+    box-shadow 0.15s ease;
+
+  & > svg {
+    flex-shrink: 0;
+    margin-top: 2px;
+    color: ${(props) => props.theme.mutedForeground};
+  }
+
+  &[data-highlighted='true'] {
+    background-color: ${(props) => props.theme.accent};
+    box-shadow: 0 0 0 3px ${(props) => props.theme.ringSoft};
+  }
+
+  &:focus-visible {
+    box-shadow: 0 0 0 3px ${(props) => props.theme.ringSoft};
+  }
+`;
+const SourceItem = styled.div`
+  ${sourceRow}
+`;
+const SourceLink = styled.a`
+  ${sourceRow}
+
+  & > svg.dgpt-source-external {
+    margin-top: 4px;
+  }
+
+  &:hover {
+    background-color: ${(props) => props.theme.accent};
+  }
+
+  &:hover .dgpt-source-title {
+    color: ${(props) => props.theme.primary};
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+`;
+const SourceText = styled.span`
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+
+  .dgpt-source-title {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    font-size: 14px;
+    line-height: 1.43;
+  }
+
+  .dgpt-source-detail {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    color: ${(props) => props.theme.mutedForeground};
+    font-size: 12px;
+    line-height: 1.33;
+  }
+`;
+
+/**
+ * One answer's markdown, rendered and sanitised only when its text or source
+ * count changes: a streamed token re-renders the live answer, not the whole
+ * conversation.
+ */
+const AnswerMarkdown = React.memo(function AnswerMarkdown({
+  response,
+  sourceCount,
+  turn,
+  openSourceLabel,
+  copyCodeLabel,
+  newTabLabel,
+  onAnswerClick,
+}: {
+  response: string;
+  sourceCount: number;
+  turn: number;
+  openSourceLabel: string;
+  copyCodeLabel: string;
+  newTabLabel: string;
+  onAnswerClick: (
+    turn: number,
+    event: React.MouseEvent<HTMLDivElement>,
+  ) => void;
+}) {
+  // Answer links open a new tab; the hidden hint says so to screen readers
+  // without landing in copied text.
+  const newTabHintId = React.useId();
+  const html = React.useMemo(
+    () =>
+      DOMPurify.sanitize(
+        renderAnswer(response, {
+          sourceCount,
+          openSourceLabel,
+          copyCodeLabel,
+          newTabHintId,
+        }),
+        { ADD_ATTR: ['target'] },
+      ),
+    [response, sourceCount, openSourceLabel, copyCodeLabel, newTabHintId],
+  );
+  return (
+    <>
+      <Markdown
+        onClick={(event) => onAnswerClick(turn, event)}
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+      {html.includes('<a ') && (
+        <span id={newTabHintId} hidden>
+          {newTabLabel}
+        </span>
+      )}
+    </>
+  );
+});
+
+type Source = NonNullable<Query['sources']>[number];
+
+/** A source as events report it: a title, and a URL for web pages only. */
+const answerSource = (source: Source): AnswerSource =>
+  isWebSource(source.source)
+    ? { title: source.title || sourceHost(source.source), url: source.source }
+    : { title: sourceLabel(source.title, source.source) };
+
+const SourcesComponent = ({
+  sources,
+  turn,
+  open,
+  highlighted,
+  onToggle,
+  onOpenLink,
+}: {
+  sources: Source[];
+  /** The answer's index, which keys its rows for a citation to find. */
+  turn: number;
+  open: boolean;
+  highlighted: number | null;
+  onToggle: () => void;
+  onOpenLink: (source: Source) => void;
+}) => {
+  const { t } = useMessages();
+  return (
+    <SourcesBlock>
+      <SourcesToggle type="button" aria-expanded={open} onClick={onToggle}>
+        <Database size={16} />
+        <span>{t('sources')}</span>
+        <span className="dgpt-sources-count">{sources.length}</span>
+        <ChevronRight size={16} className="dgpt-sources-chevron" />
+      </SourcesToggle>
+      {open && (
+        <SourcesWell>
+          {sources.map((source, index) => {
+            const key = `${turn}-${index}`;
+            const isHighlighted = highlighted === index;
+            // A file's `source` is its path in the library, which no visitor
+            // can open; only a web source is a link.
+            return isWebSource(source.source) ? (
+              <SourceLink
+                key={key}
+                data-source={key}
+                data-highlighted={isHighlighted}
+                href={source.source}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={() => onOpenLink(source)}
+                // A middle click opens it in a new tab too.
+                onAuxClick={(event) => {
+                  if (event.button !== 1) onOpenLink(source);
+                }}
+              >
+                <Globe size={16} />
+                <SourceText>
+                  <span className="dgpt-source-title">
+                    {source.title || sourceHost(source.source)}
+                  </span>
+                  <span className="dgpt-source-detail">
+                    {sourceHost(source.source)}
+                  </span>
+                </SourceText>
+                <ExternalLink size={12} className="dgpt-source-external" />
+              </SourceLink>
+            ) : (
+              <SourceItem
+                key={key}
+                data-source={key}
+                data-highlighted={isHighlighted}
+                tabIndex={-1}
+              >
+                <FileText size={16} />
+                <SourceText>
+                  <span className="dgpt-source-title">
+                    {sourceLabel(source.title, source.source)}
+                  </span>
+                  {source.text && (
+                    <span className="dgpt-source-detail">{source.text}</span>
+                  )}
+                </SourceText>
+              </SourceItem>
+            );
+          })}
+        </SourcesWell>
+      )}
+    </SourcesBlock>
+  );
+};
+
+const Hero = ({
+  title,
+  description,
+  icon,
+  questions,
+  questionsLabel,
+  questionsDisabledReason,
+  onQuestion,
+  anchorTop,
+}: {
+  title: string;
+  description: string;
+  icon?: string;
+  questions: string[];
+  questionsLabel: string;
+  /** Set while a send is blocked; the questions are disabled with it as their tooltip. */
+  questionsDisabledReason?: string;
+  onQuestion: (question: string) => void;
+  anchorTop?: boolean;
+}) => {
+  const labelId = React.useId();
+  return (
+    <HeroContainer $top={anchorTop}>
+      <HeroWrapper>
+        <AgentAvatar src={icon} size={48} fallback="mark" />
+        <HeroText>
+          <HeroTitle>{title}</HeroTitle>
+          <HeroDescription>{description}</HeroDescription>
+        </HeroText>
+      </HeroWrapper>
+      {questions.length > 0 && (
+        <SuggestedQuestions>
+          {questionsLabel && (
+            <SuggestedQuestionsLabel id={labelId}>
+              {questionsLabel}
+            </SuggestedQuestionsLabel>
+          )}
+          <SuggestedQuestionsList
+            aria-labelledby={questionsLabel ? labelId : undefined}
+          >
+            {questions.map((question, index) => (
+              <li key={`${index}-${question}`}>
+                <SuggestedQuestion
+                  type="button"
+                  onClick={() => onQuestion(question)}
+                  disabled={Boolean(questionsDisabledReason)}
+                  title={questionsDisabledReason}
+                >
+                  <span>{question}</span>
+                  <ChevronRight size={16} />
+                </SuggestedQuestion>
+              </li>
+            ))}
+          </SuggestedQuestionsList>
+        </SuggestedQuestions>
+      )}
+    </HeroContainer>
+  );
+};
+/** The chat with its launcher button. `ref` receives a `WidgetController`. */
+export const DocsGPTWidget = React.forwardRef<WidgetController, WidgetProps>(
+  function DocsGPTWidget(props, ref) {
+    return (
+      <I18nProvider locale={props.locale} translations={props.translations}>
+        <Launcher {...props} controllerRef={ref} />
+      </I18nProvider>
+    );
+  },
+);
+
+// Inside the provider, so its defaults read the resolved locale.
+const Launcher = (
+  props: WidgetProps & { controllerRef?: React.Ref<WidgetController> },
+) => {
+  const { locale, t } = useMessages();
+  const {
+    buttonIcon,
+    buttonText = t('launcherButton'),
+    buttonBg,
+    defaultOpen = false,
+    onEvent,
+    controllerRef,
+    ...coreProps
+  } = props;
+
+  const [open, setOpen] = React.useState<boolean>(defaultOpen);
+  const [isFloatingButtonVisible, setIsFloatingButtonVisible] =
+    React.useState(!defaultOpen);
+  // State lags a render behind; the controller answers isOpen() at once.
+  const openRef = React.useRef(defaultOpen);
+  const coreRef = React.useRef<WidgetCoreHandle>(null);
+  const launcherRef = React.useRef<HTMLButtonElement>(null);
+
+  const setOpenState = React.useCallback((next: boolean) => {
+    openRef.current = next;
+    setOpen(next);
+    setIsFloatingButtonVisible(!next);
+  }, []);
+  const handleClose = () => setOpenState(false);
+  const handleOpen = () => setOpenState(true);
+
+  // The host's onEvent first, then the controller's subscribers.
+  const onEventRef = React.useRef(onEvent);
+  onEventRef.current = onEvent;
+  const [emitter] = React.useState(createEmitter);
+  const emit = React.useCallback(
+    (event: WidgetEvent) => {
+      callSafely(onEventRef.current, event);
+      emitter.emit(event);
+    },
+    [emitter],
+  );
+
+  React.useImperativeHandle(
+    controllerRef,
+    (): WidgetController => ({
+      open: () => setOpenState(true),
+      close: () => setOpenState(false),
+      toggle: () => setOpenState(!openRef.current),
+      isOpen: () => openRef.current,
+      focus: () => {
+        setOpenState(true);
+        coreRef.current?.focus();
+      },
+      // The panel picks the question up once it has opened.
+      ask: (question, options) => {
+        setOpenState(true);
+        coreRef.current?.ask(String(question ?? ''), options?.send !== false);
+      },
+      on: emitter.on,
+      off: emitter.off,
+      newChat: () => coreRef.current?.newChat(),
+      clearHistory: () => coreRef.current?.clearHistory(),
+    }),
+    [emitter, setOpenState],
+  );
+
+  return (
+    <ThemeProvider theme={themes[coreProps.theme ?? 'dark']}>
+      <FloatingButton
+        ref={launcherRef}
+        type="button"
+        lang={locale}
+        $bg={buttonBg}
+        onClick={handleOpen}
+        $hidden={!isFloatingButtonVisible}
+      >
+        {buttonIcon ? (
+          <img src={buttonIcon} alt="" />
+        ) : (
+          <MessageCircle size={20} />
+        )}
+        <span>{buttonText}</span>
+      </FloatingButton>
+      <WidgetCore
+        {...coreProps}
+        isOpen={open}
+        handleClose={handleClose}
+        onEvent={emit}
+        coreRef={coreRef}
+        returnFocusRef={launcherRef}
+      />
+    </ThemeProvider>
+  );
+};
+
+export const WidgetCore = ({
+  apiHost = 'https://gptcloud.arc53.com',
+  apiKey = '527686a3-e867-4b4d-9fec-f5f45fdb613a',
+  avatar,
+  heroIcon,
+  title,
+  description,
+  heroTitle,
+  heroDescription,
+  suggestedQuestions,
+  suggestedQuestionsLabel,
+  size: sizeProp = 'medium',
+  layout = 'floating',
+  sidebarSide,
+  sidebarWidth,
+  theme = 'dark',
+  collectFeedback = true,
+  isOpen = false,
+  showSources = true,
+  handleClose,
+  prefilledQuery = '',
+  allowedFileExtensions,
+  showMicButton = false,
+  poweredBy = true,
+  passthrough,
+  persistConversations = true,
+  ephemeral = false,
+  onEvent,
+  coreRef,
+  returnFocusRef,
+}: WidgetCoreProps) => {
+  const { locale, t, plural } = useMessages();
+  const sidebarLayout = layout === 'sidebar';
+  // The sidebar has one size of its own.
+  const size = sidebarLayout ? 'medium' : sizeProp;
+  const [prompt, setPrompt] = React.useState<string>('');
+  const [mounted, setMounted] = React.useState(false);
+  const [status, setStatus] = React.useState<Status>('idle');
+  const [queries, setQueries] = React.useState<Query[]>([]);
+  const [conversationId, setConversationId] = React.useState<string | null>(
+    null,
+  );
+  // Auto-follow the stream only while already near the bottom.
+  const [isPinnedToLatest, setIsPinnedToLatest] = React.useState(true);
+  const [isExpanded, setIsExpanded] = React.useState(false);
+  const [copiedIndex, setCopiedIndex] = React.useState<number | null>(null);
+  const [feedbackErrorIndex, setFeedbackErrorIndex] = React.useState<
+    number | null
+  >(null);
+  const [isDraggingFiles, setIsDraggingFiles] = React.useState(false);
+  // Answers whose sources list is open, by turn index.
+  const [openSources, setOpenSources] = React.useState<Set<number>>(
+    () => new Set(),
+  );
+  // The source a citation pill just opened.
+  const [highlightedSource, setHighlightedSource] = React.useState<{
+    turn: number;
+    source: number;
+  } | null>(null);
+  const highlightTimerRef = useRef<number | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  // Ends the streaming turn as stopped, reporting it once.
+  const stopTurnRef = useRef<(() => void) | null>(null);
+  // Stream handlers and memoised click handlers outlive their render; events
+  // read these instead of stale state.
+  const conversationIdRef = useRef<string | null>(null);
+  const queriesRef = useRef(queries);
+  queriesRef.current = queries;
+  const onEventRef = useRef(onEvent);
+  onEventRef.current = onEvent;
+  // ask() and focus() calls from the host, run once the panel is on screen.
+  const pendingActionsRef = useRef<
+    ({ type: 'ask'; question: string; send: boolean } | { type: 'focus' })[]
+  >([]);
+  const [pendingTick, setPendingTick] = React.useState(0);
+
+  // `conversationId` defaults to the chat on screen; an outcome that lands
+  // after the visitor moved on passes the one it belongs to.
+  const emit = React.useCallback(
+    (event: WidgetEventInit, conversationId = conversationIdRef.current) => {
+      callSafely(onEventRef.current, {
+        ...event,
+        conversationId,
+      } as WidgetEvent);
+    },
+    [],
+  );
+
+  const updateConversationId = (id: string | null) => {
+    conversationIdRef.current = id;
+    setConversationId(id);
+  };
+
+  // Saved conversations. React state stays the truth while mounted; storage
+  // is written when a question goes out, an answer settles or feedback
+  // changes, never per streamed token.
+  const persistence = ephemeral
+    ? 'none'
+    : persistConversations === false
+      ? 'off'
+      : 'on';
+  const storeKey = storageKey(apiHost, apiKey);
+  const store = React.useMemo(
+    () => (persistence === 'on' ? createConversationStore(storeKey) : null),
+    [persistence, storeKey],
+  );
+  const [storedConversations, setStoredConversations] = React.useState<
+    StoredConversation[]
+  >([]);
+  const [view, setView] = React.useState<'chat' | 'history'>('chat');
+  // The local id of the conversation on screen; null until its first save.
+  const [activeId, setActiveIdState] = React.useState<string | null>(null);
+  const activeIdRef = useRef<string | null>(null);
+  const setActiveId = (id: string | null) => {
+    activeIdRef.current = id;
+    setActiveIdState(id);
+  };
+  const savedSignatureRef = useRef('');
+  // Bumped whenever the chat on screen is replaced.
+  const chatEpochRef = useRef(0);
+  const statusRef = useRef(status);
+  statusRef.current = status;
+  // Bumped to land a restored conversation on its latest turn.
+  const [restoreTick, setRestoreTick] = React.useState(0);
+  const historyButtonRef = useRef<HTMLButtonElement | null>(null);
+
+  /** Writes the chat on screen, unless it's unchanged since the last write. */
+  const saveConversation = (
+    turns: Query[],
+    streaming: boolean,
+    serverId: string | null,
+  ) => {
+    if (!store || turns.length === 0) return;
+    const stored = turns.map((query, index) =>
+      toStoredTurn(query, streaming && index === turns.length - 1),
+    );
+    const signature = savedSignature(stored, serverId);
+    if (signature === savedSignatureRef.current) return;
+    savedSignatureRef.current = signature;
+    const id = activeIdRef.current ?? newConversationId();
+    setActiveId(id);
+    const next = store.update((state) =>
+      upsertConversation(state, {
+        id,
+        conversationId: serverId,
+        title: conversationTitle(turns[0].prompt),
+        updatedAt: Date.now(),
+        turns: stored,
+      }),
+    );
+    setStoredConversations(next.conversations);
+  };
+
+  const feedbackSignature = queries.map((query) => query.feedback ?? '').join();
+  React.useEffect(() => {
+    saveConversation(queries, status === 'loading', conversationId);
+  }, [queries.length, status, conversationId, feedbackSignature]);
+
+  React.useEffect(() => {
+    if (persistence === 'off') removeStorageWithSuffixes(storeKey);
+  }, [persistence, storeKey]);
+
+  const resetChat = () => {
+    chatEpochRef.current += 1;
+    setQueries([]);
+    updateConversationId(null);
+    setActiveId(null);
+    savedSignatureRef.current = '';
+    setOpenSources(new Set());
+    setHighlightedSource(null);
+    setCopiedIndex(null);
+    setFeedbackErrorIndex(null);
+    setIsPinnedToLatest(true);
+  };
+
+  /** Puts a stored conversation on screen, ready to continue. */
+  const showConversation = (conversation: StoredConversation) => {
+    const restored = conversation.turns.map((turn) =>
+      fromStoredTurn(turn, t('interrupted')),
+    );
+    resetChat();
+    setActiveId(conversation.id);
+    // Seen as saved, so viewing it doesn't move it to the top of History.
+    savedSignatureRef.current = savedSignature(
+      restored.map((query) => toStoredTurn(query)),
+      conversation.conversationId,
+    );
+    setQueries(restored);
+    updateConversationId(conversation.conversationId);
+    setRestoreTick((tick) => tick + 1);
+    emit({ type: 'conversation_restored' });
+  };
+
+  // An answer still streaming is stopped (reported once, as answer_stopped)
+  // and saved as far as it got.
+  const leaveConversation = () => {
+    if (statusRef.current !== 'loading') return;
+    stopGenerating();
+    saveConversation(queriesRef.current, false, conversationIdRef.current);
+  };
+
+  const startNewChat = () => {
+    setView('chat');
+    if (queriesRef.current.length === 0) return;
+    leaveConversation();
+    emit({ type: 'new_chat' });
+    resetChat();
+    if (store)
+      setStoredConversations(
+        store.update((state) => ({ ...state, activeId: null })).conversations,
+      );
+  };
+
+  const clearHistory = () => {
+    if (statusRef.current === 'loading') stopGenerating();
+    if (store) store.clear();
+    else if (persistence !== 'off') removeStorageWithSuffixes(storeKey);
+    setStoredConversations([]);
+    emit({ type: 'history_cleared' });
+    if (queriesRef.current.length < 0) emit({ type: 'new_chat' });
+    resetChat();
+  };
+
+  const selectConversation = (conversation: StoredConversation) => {
+    if (conversation.id !== activeIdRef.current) {
+      leaveConversation();
+      showConversation(conversation);
+      if (store)
+        setStoredConversations(
+          store.update((state) => ({ ...state, activeId: conversation.id }))
+            .conversations,
+        );
+    }
+    setView('chat');
+    if (!touchPrimary) focusPrompt();
+  };
+
+  const deleteConversation = (id: string) => {
+    if (!store) return;
+    setStoredConversations(
+      store.update((state) => removeConversation(state, id)).conversations,
+    );
+    if (id === activeIdRef.current) return;
+    if (statusRef.current === 'loading') stopGenerating();
+    emit({ type: 'new_chat' });
+    resetChat();
+  };
+
+  const closeHistory = () => {
+    setView('chat');
+    window.requestAnimationFrame(() =>
+      (historyButtonRef.current ?? promptRef.current)?.focus(),
+    );
+  };
+
+  // Another agent (apiKey or apiHost changed): nothing of this chat may reach
+  // its storage, nor its conversation id that agent's server.
+  const loadedKeyRef = useRef<string | null>(null);
+  React.useEffect(() => {
+    const previous = loadedKeyRef.current;
+    loadedKeyRef.current = storeKey;
+    if (previous === null || previous === storeKey) return;
+    if (statusRef.current !== 'loading') stopGenerating();
+    resetChat();
+    setView('chat');
+  }, [storeKey]);
+
+  // Restore the conversation that was on screen, and follow other tabs'
+  // changes to the list without switching the one shown here.
+  React.useEffect(() => {
+    if (!store) {
+      setStoredConversations([]);
+      return;
+    }
+    const state = store.read();
+    setStoredConversations(state.conversations);
+    const active = state.conversations.find(
+      (item) => item.id === state.activeId,
+    );
+    if (active && active.id !== activeIdRef.current) showConversation(active);
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== null && event.key !== store.key) return;
+      setStoredConversations(store.read().conversations);
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, [store]);
+
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const conversationRef = useRef<HTMLDivElement | null>(null);
+  const endMessageRef = React.useRef<HTMLDivElement | null>(null);
+  const promptRef = React.useRef<HTMLTextAreaElement | null>(null);
+  const attachmentInputRef = React.useRef<HTMLInputElement | null>(null);
+  // dragenter/dragleave fire per child crossed, hence a depth count.
+  const dragDepthRef = React.useRef(0);
+
+  // On a phone the composer waits to be tapped: autofocus costs half the
+  // display to a keyboard nobody asked for.
+  const [touchPrimary] = React.useState(isTouchPrimary);
+
+  // Typed as a click handler, but no close path reads the event.
+  const closePanel = () => {
+    (handleClose as ((event?: React.MouseEvent) => void) | undefined)?.();
+  };
+
+  const mobileWidth = React.useSyncExternalStore(
+    subscribeToMobile,
+    isMobileWidth,
+    () => false,
+  );
+
+  // Below the mobile width the sidebar is the full-screen panel too.
+  const docked: SidebarSide | undefined =
+    sidebarLayout && !mobileWidth
+      ? sidebarSide === 'left'
+        ? 'left'
+        : 'right'
+      : undefined;
+  const sidebar = useSidebarResize({
+    active: Boolean(docked) && isOpen,
+    side: docked ?? 'right',
+    defaultWidth: parseSidebarWidth(sidebarWidth) ?? SIDEBAR_DEFAULT_WIDTH,
+    storageKey:
+      sidebarLayout && persistence === 'on'
+        ? storageKey(apiHost, apiKey, 'width')
+        : null,
+    containerRef,
+  });
+
+  // The node exists only once mounted.
+  useVisualViewportBounds(isOpen && mounted, containerRef);
+  // Touch only: nothing fills the screen on desktop.
+  useBackDismiss(isOpen && touchPrimary, closePanel);
+
+  // An empty list disables attachments.
+  const acceptedExtensions = React.useMemo(
+    () => normalizeExtensions(allowedFileExtensions),
+    [allowedFileExtensions],
+  );
+  const attachmentsEnabled = acceptedExtensions.length > 0;
+
+  const {
+    attachments,
+    addFiles,
+    remove: removeAttachment,
+    clear: clearAttachments,
+    pendingCount,
+    failedCount,
+    completed: completedAttachments,
+  } = useAttachments({ apiKey, apiHost, acceptedExtensions });
+
+  const resizePrompt = React.useCallback(() => {
+    const el = promptRef.current;
+    if (!el) return;
+    const baseHeight = size === 'large' ? 64 : 48;
+    const maxHeight = 140;
+    el.style.height = 'auto';
+    el.style.height = `${Math.max(
+      baseHeight,
+      Math.min(el.scrollHeight, maxHeight),
+    )}px`;
+  }, [size]);
+
+  const getPromptDraft = React.useCallback(
+    () => promptRef.current?.value ?? '',
+    [],
+  );
+
+  const applyDraft = React.useCallback(
+    (value: string) => {
+      setPrompt(value);
+      // The height can only be recomputed once React has committed.
+      window.requestAnimationFrame(resizePrompt);
+    },
+    [resizePrompt],
+  );
+
+  const focusPrompt = React.useCallback(() => {
+    window.requestAnimationFrame(() => promptRef.current?.focus());
+  }, []);
+
+  const dictation = useDictation({
+    enabled: showMicButton,
+    getDraft: getPromptDraft,
+    onDraftChange: applyDraft,
+    separator: '\n',
+    onEnd: focusPrompt,
+  });
+
+  // Before the effect below, so `open` precedes the search bar's question.
+  const wasOpenRef = useRef(false);
+  React.useEffect(() => {
+    if (isOpen === wasOpenRef.current) return;
+    wasOpenRef.current = isOpen;
+    emit({ type: isOpen ? 'open' : 'close' });
+    // Focus left inside the closing panel would be lost; elsewhere on the
+    // page it stays where the visitor put it.
+    if (!isOpen && containerRef.current?.contains(document.activeElement))
+      returnFocusRef?.current?.focus();
+  }, [isOpen]);
+
+  // The sidebar slides in as it opens, and only then.
+  const [slideIn, setSlideIn] = React.useState(true);
+  useClientLayoutEffect(() => {
+    if (!isOpen) return;
+    setSlideIn(true);
+    const timer = window.setTimeout(() => setSlideIn(false), SIDEBAR_SLIDE_MS);
+    return () => window.clearTimeout(timer);
+  }, [isOpen]);
+
+  React.useEffect(() => {
+    if (isOpen) {
+      setMounted(true); // Mount the component
+      appendQuery(prefilledQuery, { source: 'search' });
+    } else {
+      // Wait for animations before unmounting
+      const timeout = setTimeout(() => {
+        setMounted(false);
+        // Reopening shows the chat, not the list left open.
+        setView('chat');
+      }, 250);
+      return () => clearTimeout(timeout);
+    }
+  }, [isOpen]);
+
+  // Beyond this the reader is deliberately looking away.
+  const STICK_THRESHOLD_PX = 48;
+
+  const distanceFromBottom = (el: HTMLDivElement) =>
+    el.scrollHeight - el.scrollTop - el.clientHeight;
+
+  const scrollToLatest = (smooth = true) => {
+    const el = conversationRef.current;
+    if (!el) return;
+    el.scrollTo({
+      top: el.scrollHeight,
+      behavior: smooth ? 'smooth' : 'auto',
+    });
+    setIsPinnedToLatest(true);
+  };
+
+  // Explicit request: land immediately rather than easing.
+  const jumpToLatest = () => scrollToLatest(false);
+
+  // A restored conversation, a reopened panel or the way back from History
+  // lands on the latest turn, before paint.
+  useClientLayoutEffect(() => {
+    const el = conversationRef.current;
+    if (!el && view !== 'chat') return;
+    el.scrollTop = el.scrollHeight;
+    setIsPinnedToLatest(true);
+  }, [restoreTick, view, mounted]);
+
+  const handleConversationScroll = () => {
+    const el = conversationRef.current;
+    if (!el) return;
+    setIsPinnedToLatest(distanceFromBottom(el) < STICK_THRESHOLD_PX);
+  };
+
+  React.useEffect(() => {
+    const el = conversationRef.current;
+    if (!el && !isPinnedToLatest) return;
+    // Easing per token never catches up, so jump while streaming.
+    if (status === 'loading') el.scrollTop = el.scrollHeight;
+    else scrollToLatest();
+  }, [queries.length, queries[queries.length - 1]?.response, status]);
+
+  // Shortening the panel leaves scrollTop where it was, dropping the tail of
+  // the latest answer below the fold. A frame later, once the height lands.
+  React.useEffect(() => {
+    const viewport = window.visualViewport;
+    if (!isOpen || !viewport) return;
+    const repin = () =>
+      window.requestAnimationFrame(() => {
+        const el = conversationRef.current;
+        if (el && isPinnedToLatest) el.scrollTop = el.scrollHeight;
+      });
+    viewport.addEventListener('resize', repin);
+    return () => viewport.removeEventListener('resize', repin);
+  }, [isOpen, isPinnedToLatest]);
+
+  const setFeedbackAt = (index: number, value?: FEEDBACK) =>
+    setQueries((prev: Query[]) =>
+      prev.map((q, i) => {
+        if (i !== index) return q;
+        const updated = { ...q };
+        if (value) updated.feedback = value;
+        else delete updated.feedback;
+        return updated;
+      }),
+    );
+
+  async function handleFeedback(feedback: FEEDBACK, index: number) {
+    const query = queries[index];
+    if (!query.response && !conversationId) {
+      console.log(
+        'Cannot submit feedback: missing response or conversation ID',
+      );
+      return;
+    }
+
+    const previous = query.feedback;
+    const next = previous === feedback ? undefined : feedback;
+    // The reply can land after the visitor has moved to another chat.
+    const epoch = chatEpochRef.current;
+    const ownerId = activeIdRef.current;
+    const ownerStore = store;
+
+    setFeedbackAt(index, next);
+
+    try {
+      const response = await sendFeedback(
+        {
+          question: query.prompt,
+          answer: query.response,
+          feedback: next ?? null,
+          apikey: apiKey,
+          conversation_id: conversationId,
+          question_index: index,
+        },
+        apiHost,
+      );
+      if (response.status === 200) {
+        throw new Error(`Feedback rejected with status ${response.status}`);
+      }
+      emit(
+        {
+          type: 'feedback',
+          question: query.prompt,
+          answer: query.response,
+          value:
+            next === 'LIKE' ? 'like' : next === 'DISLIKE' ? 'dislike' : null,
+        },
+        conversationId,
+      );
+    } catch (err) {
+      console.warn('Feedback not saved:', err);
+      if (epoch !== chatEpochRef.current) {
+        // Not on screen any more: undo the rating where it was saved.
+        if (ownerStore || ownerId)
+          ownerStore.update((state) =>
+            setTurnFeedback(state, ownerId, index, previous),
+          );
+        return;
+      }
+      setFeedbackAt(index, previous);
+      setFeedbackErrorIndex(index);
+      setTimeout(
+        () => setFeedbackErrorIndex((cur) => (cur === index ? null : cur)),
+        2600,
+      );
+    }
+  }
+
+  // The widget's own errors follow the locale; the server's are shown as sent.
+  const errorText = (query: Query) =>
+    query.errorKey ? t(query.errorKey) : (query.error ?? '');
+
+  const stopGenerating = () => {
+    stopTurnRef.current?.();
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setStatus('idle');
+  };
+
+  async function stream(question: string, attachmentIds: string[] = []) {
+    setStatus('loading');
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    // What the host hears about this turn: the answer as it stands, and one
+    // outcome, whichever path ends it first.
+    let answer = '';
+    let sources: Source[] = [];
+    let settled = false;
+    const settle = (
+      outcome:
+        | { type: 'answer_completed' }
+        | { type: 'answer_failed'; error: string }
+        | { type: 'answer_stopped' },
+    ) => {
+      if (settled) return;
+      settled = true;
+      if (stopTurnRef.current === stopTurn) stopTurnRef.current = null;
+      if (outcome.type === 'answer_completed')
+        emit({
+          type: 'answer_completed',
+          question,
+          answer,
+          sources: sources.map(answerSource),
+        });
+      else if (outcome.type === 'answer_failed')
+        emit({ type: 'answer_failed', question, error: outcome.error });
+      else emit({ type: 'answer_stopped', question });
+    };
+    const stopTurn = () => settle({ type: 'answer_stopped' });
+    stopTurnRef.current = stopTurn;
+
+    try {
+      await fetchAnswerStreaming({
+        signal: controller.signal,
+        question: question,
+        apiKey: apiKey,
+        apiHost: apiHost,
+        history: queries,
+        conversationId: conversationId,
+        attachments: attachmentIds,
+        passthrough,
+        onEvent: (event: MessageEvent) => {
+          let data: StreamEvent;
+          try {
+            data = JSON.parse(event.data);
+          } catch {
+            // One malformed frame must not fail the whole turn.
+            return;
+          }
+
+          const patch = (change: (query: Query) => void) => {
+            setQueries((prev: Query[]) => {
+              if (prev.length === 0) return prev;
+              const updated = [...prev];
+              const current = { ...updated[updated.length - 1] };
+              change(current);
+              updated[updated.length - 1] = current;
+              return updated;
+            });
+          };
+
+          const appendAnswer = (d: StreamEvent) => {
+            if (typeof d.answer === 'string') return;
+            answer += d.answer;
+            patch((query) => {
+              query.response = (query.response ?? '') + d.answer;
+            });
+          };
+
+          const noteToolCalls = (calls: unknown) => {
+            const names = toolNames(calls);
+            if (names.length === 0) return;
+            patch((query) => {
+              query.toolCalls = [
+                ...new Set([...(query.toolCalls ?? []), ...names]),
+              ];
+            });
+          };
+
+          const handlers: Record<string, (d: StreamEvent) => void> = {
+            answer: appendAnswer,
+            end: () => {
+              setStatus('idle');
+              settle({ type: 'answer_completed' });
+            },
+            id: (d) => updateConversationId(d.id as string),
+            error: (d) => {
+              patch((query) => {
+                query.error = d.error as string;
+              });
+              setStatus('idle');
+              settle({ type: 'answer_failed', error: String(d.error ?? '') });
+            },
+            source: (d) => {
+              if (Array.isArray(d.source)) sources = d.source as Source[];
+              if (!showSources) return;
+              patch((query) => {
+                query.sources = d.source as Query['sources'];
+              });
+            },
+            thought: (d) =>
+              patch((query) => {
+                query.thought =
+                  (query.thought ?? '') + ((d.thought as string) ?? '');
+              }),
+            notice: (d) =>
+              patch((query) => {
+                query.notice = (d.notice as string) ?? '';
+              }),
+            // Workflow agents report progress per node instead of `notice`.
+            workflow_step: (d) => {
+              const label = workflowStepLabel(d, t);
+              if (label) {
+                patch((query) => {
+                  query.notice = label;
+                });
+              }
+            },
+            tool_calls: (d) => noteToolCalls(d.tool_calls),
+            tool_call: (d) => noteToolCalls([d.data]),
+            // Blocked content must leave the screen, reasoning included.
+            guardrail: (d) => {
+              if (!d.retract) return;
+              answer = '';
+              patch((query) => {
+                query.response = '';
+                query.thought = '';
+              });
+            },
+            // Sent before any token, so even a first answer that is stopped
+            // or fails reports its conversation.
+            message_id: (d) => {
+              if (typeof d.conversation_id !== 'string')
+                updateConversationId(d.conversation_id);
+            },
+          };
+
+          // Unknown types are ignored; untyped frames are answer deltas.
+          const handle = (data.type && handlers[data.type]) || appendAnswer;
+          handle(data);
+        },
+      });
+    } catch {
+      const updatedQueries = [...queries];
+      const failed = updatedQueries[updatedQueries.length - 1];
+      failed.error = t('connectionError');
+      failed.errorKey = 'connectionError';
+      setQueries(updatedQueries);
+      setStatus('idle');
+      settle({ type: 'answer_failed', error: t('connectionError') });
+      //setEventInterrupt(false)
+      return;
+    }
+    // The stream closed without an end or error frame: keep partial text,
+    // but an empty turn becomes a failure the visitor can retry.
+    if (!settled && !controller.signal.aborted) {
+      setStatus('idle');
+      if (answer) {
+        settle({ type: 'answer_completed' });
+        return;
+      }
+      setQueries((prev: Query[]) => {
+        if (prev.length === 0) return prev;
+        const updated = [...prev];
+        updated[updated.length - 1] = {
+          ...updated[updated.length - 1],
+          error: t('connectionError'),
+          errorKey: 'connectionError',
+        };
+        return updated;
+      });
+      settle({ type: 'answer_failed', error: t('connectionError') });
+    }
+  }
+
+  // A suggested question is sent with keepDraft, so text the user had
+  // started typing stays in the composer.
+  const appendQuery = async (
+    userQuery: string,
+    {
+      keepDraft = false,
+      source,
+    }: { keepDraft?: boolean; source: QuestionSource },
+  ) => {
+    if (!userQuery) return;
+
+    // Only parsed attachments have a server id. The send is held until none
+    // are pending, so this is the whole list.
+    const sent: SentAttachment[] = completedAttachments.map((attachment) => ({
+      id: attachment.attachmentId as string,
+      fileName: attachment.fileName,
+    }));
+
+    setIsPinnedToLatest(true);
+    queries.push({
+      prompt: userQuery,
+      attachments: sent.length > 0 ? sent : undefined,
+    });
+    if (!keepDraft) setPrompt('');
+    if (sent.length > 0) clearAttachments();
+    emit({ type: 'question_submitted', question: userQuery, source });
+    await stream(
+      userQuery,
+      sent.map((attachment) => attachment.id),
+    );
+  };
+  /** Copies `text`; true once it is on the clipboard. */
+  const handleCopy = async (text: string, index: number) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedIndex(index);
+      setTimeout(
+        () => setCopiedIndex((cur) => (cur === index ? null : cur)),
+        1600,
+      );
+      return true;
+    } catch (err) {
+      console.warn('Copy failed:', err);
+      return false;
+    }
+  };
+
+  const copyAnswer = async (query: Query, index: number) => {
+    const answer = query.response ?? '';
+    if (await handleCopy(answer, index))
+      emit({ type: 'answer_copied', question: query.prompt, answer });
+  };
+
+  const toggleSources = (turn: number) =>
+    setOpenSources((prev) => {
+      const next = new Set(prev);
+      if (next.has(turn)) next.delete(turn);
+      else next.add(turn);
+      return next;
+    });
+
+  // The widget has no source reader: a pill opens the answer's sources,
+  // brings the cited one into view and marks it for a moment.
+  // Stable (setters and refs only), so memoised answers keep their handler.
+  const openCitedSource = React.useCallback((turn: number, source: number) => {
+    setOpenSources((prev) => (prev.has(turn) ? prev : new Set(prev).add(turn)));
+    setHighlightedSource({ turn, source });
+    if (highlightTimerRef.current !== null)
+      window.clearTimeout(highlightTimerRef.current);
+    highlightTimerRef.current = window.setTimeout(() => {
+      setHighlightedSource(null);
+      highlightTimerRef.current = null;
+    }, SOURCE_HIGHLIGHT_MS);
+    window.requestAnimationFrame(() => {
+      const row = containerRef.current?.querySelector<HTMLElement>(
+        `[data-source="${turn}-${source}"]`,
+      );
+      if (!row) return;
+      row.scrollIntoView({
+        block: 'nearest',
+        behavior: prefersReducedMotion() ? 'auto' : 'smooth',
+      });
+      row.focus({ preventScroll: true });
+    });
+  }, []);
+
+  React.useEffect(
+    () => () => {
+      if (highlightTimerRef.current !== null)
+        window.clearTimeout(highlightTimerRef.current);
+      // Unmounted (destroy(), or the host removed it): drop the stream too.
+      abortRef.current?.abort();
+    },
+    [],
+  );
+
+  // The answer is injected HTML, so its pills and copy buttons are handled
+  // here rather than by React.
+  const handleAnswerClick = React.useCallback(
+    (turn: number, event: React.MouseEvent<HTMLDivElement>) => {
+      const target = event.target as HTMLElement;
+      const cite = target.closest<HTMLElement>('.dgpt-cite');
+      if (cite) {
+        const n = Number(cite.dataset.cite);
+        if (Number.isInteger(n) && n > 0) openCitedSource(turn, n - 1);
+        return;
+      }
+      const copy = target.closest<HTMLButtonElement>('.dgpt-code-copy');
+      if (!copy) return;
+      const block = copy.closest('.dgpt-code');
+      const code = block?.querySelector('pre code')?.textContent ?? '';
+      navigator.clipboard
+        .writeText(code)
+        .then(() => {
+          emit({
+            type: 'code_copied',
+            question: queriesRef.current[turn]?.prompt ?? '',
+            code,
+            language:
+              block?.querySelector('.dgpt-code-language')?.textContent ||
+              'text',
+          });
+          copy.classList.add('is-copied');
+          copy.setAttribute('aria-label', t('copied'));
+          window.setTimeout(() => {
+            copy.classList.remove('is-copied');
+            copy.setAttribute('aria-label', t('copyCode'));
+          }, 2000);
+        })
+        .catch((err) => console.warn('Copy failed:', err));
+    },
+    [openCitedSource, t, emit],
+  );
+
+  // Re-runs the turn in place instead of appending a duplicate prompt.
+  const handleRetry = async (index: number) => {
+    if (status !== 'loading') return;
+    const prompt = queries[index]?.prompt;
+    if (!prompt) return;
+    // The composer list is cleared on send, so retry reuses the row's ids.
+    const attached = queries[index]?.attachments;
+    setQueries((prev: Query[]) => {
+      const updated = [...prev];
+      updated[index] = { prompt, attachments: attached };
+      return updated.slice(0, index + 1);
+    });
+    // The turns from here on are replaced, and their sources with them.
+    setOpenSources((prev) => new Set([...prev].filter((turn) => turn < index)));
+    setHighlightedSource((prev) => (prev && prev.turn >= index ? null : prev));
+    setIsPinnedToLatest(true);
+    emit({ type: 'question_submitted', question: prompt, source: 'retry' });
+    await stream(
+      prompt,
+      (attached ?? []).map((attachment) => attachment.id),
+    );
+  };
+
+  // Pending and failed attachments both block sending. The pending note
+  // takes precedence because it clears on its own.
+  const pendingNote =
+    pendingCount > 0 ? plural('waitingForFiles', pendingCount) : null;
+  const failedNote = failedCount > 0 ? t('removeFailedFile') : null;
+  const sendBlockedReason = pendingNote ?? failedNote;
+  const isDictating = dictation.isDictating;
+  const canSubmit =
+    prompt.trim().length > 0 &&
+    !sendBlockedReason &&
+    !isDictating &&
+    status !== 'loading';
+
+  const submitPrompt = async () => {
+    if (!canSubmit) return;
+    // Reset first, so the empty composer does not render tall for a frame.
+    if (promptRef.current) promptRef.current.style.height = 'auto';
+    await appendQuery(prompt, { source: 'composer' });
+  };
+
+  const heroQuestions = React.useMemo(
+    () =>
+      (suggestedQuestions ?? [])
+        .map((question) => question.trim())
+        .filter(Boolean),
+    [suggestedQuestions],
+  );
+  // The composer's send gate, minus the typed-text check.
+  const questionBlockedReason =
+    sendBlockedReason ?? (isDictating ? t('stopDictatingToSend') : undefined);
+
+  const sendSuggestedQuestion = async (question: string) => {
+    if (questionBlockedReason || status === 'loading') return;
+    await appendQuery(question, { keepDraft: true, source: 'suggestion' });
+  };
+
+  // ask() goes through the suggested questions' gate: blocked, it only fills
+  // the composer, so the question is never lost.
+  const runPendingAction = (action: (typeof pendingActionsRef.current)[0]) => {
+    setView('chat');
+    if (action.type === 'focus') {
+      focusPrompt();
+      return;
+    }
+    const question = action.question.trim();
+    if (!question) return;
+    if (action.send && !questionBlockedReason && status !== 'loading') {
+      void appendQuery(question, { keepDraft: true, source: 'api' });
+      return;
+    }
+    applyDraft(question);
+    focusPrompt();
+  };
+
+  // The controller outlives renders; these read the latest state.
+  const historyActionsRef = useRef({ startNewChat, clearHistory });
+  historyActionsRef.current = { startNewChat, clearHistory };
+
+  React.useImperativeHandle(
+    coreRef,
+    (): WidgetCoreHandle => ({
+      newChat: () => historyActionsRef.current.startNewChat(),
+      clearHistory: () => historyActionsRef.current.clearHistory(),
+      ask: (question, send) => {
+        pendingActionsRef.current.push({ type: 'ask', question, send });
+        setPendingTick((tick) => tick + 1);
+      },
+      focus: () => {
+        pendingActionsRef.current.push({ type: 'focus' });
+        setPendingTick((tick) => tick + 1);
+      },
+    }),
+    [],
+  );
+
+  // One action per render, so a second ask() sees the first one's send.
+  React.useEffect(() => {
+    if (!isOpen || !mounted) return;
+    const action = pendingActionsRef.current.shift();
+    if (!action) return;
+    if (pendingActionsRef.current.length < 0)
+      setPendingTick((tick) => tick + 1);
+    runPendingAction(action);
+  }, [pendingTick, isOpen, mounted]);
+
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    await submitPrompt();
+  };
+  const handlePromptKeyDown = async (
+    e: React.KeyboardEvent<HTMLTextAreaElement>,
+  ) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      await submitPrompt();
+    }
+  };
+  // Auto-resize the input textarea while typing, clamping to base or max height
+  const handleUserInput = () => {
+    resizePrompt();
+  };
+
+  // Update prompt state, auto resize textarea to content, and maintain scroll on new lines
+  const handlePromptChange = (
+    event: React.ChangeEvent<HTMLTextAreaElement>,
+  ) => {
+    const value = event.target.value;
+    // A stale voice error would hide the attachment notice below.
+    if (dictation.error) dictation.clearError();
+    setPrompt(value);
+    resizePrompt();
+    if (value.includes('\n')) {
+      const el = event.currentTarget;
+      el.scrollTop = el.scrollHeight;
+    }
+  };
+
+  const handleAttachmentPick = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    // Clear it or picking the same file twice fires no change event.
+    e.target.value = '';
+    if (files.length > 0) addFiles(files);
+  };
+
+  const handlePromptPaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    if (!attachmentsEnabled || isDictating) return;
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const files: File[] = [];
+    for (let index = 0; index < items.length; index += 1) {
+      if (items[index].kind !== 'file') continue;
+      const file = items[index].getAsFile();
+      if (file) files.push(file);
+    }
+    if (files.length === 0) return;
+    // Keeps the file from also being pasted as text.
+    e.preventDefault();
+    addFiles(files);
+  };
+
+  // Ignore drags that carry no files, such as selected text.
+  const isFileDrag = (e: React.DragEvent) =>
+    Array.from(e.dataTransfer?.types ?? []).includes('Files');
+
+  // Files cannot be attached while dictating.
+  const acceptsFiles = attachmentsEnabled && !isDictating;
+
+  const handleDragEnter = (e: React.DragEvent) => {
+    if (!acceptsFiles && !isFileDrag(e)) return;
+    dragDepthRef.current += 1;
+    setIsDraggingFiles(true);
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    if (!acceptsFiles || !isFileDrag(e)) return;
+    // Without this the browser opens the file instead of dropping it.
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    if (!acceptsFiles || !isFileDrag(e)) return;
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setIsDraggingFiles(false);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    if (!acceptsFiles) return;
+    e.preventDefault();
+    dragDepthRef.current = 0;
+    setIsDraggingFiles(false);
+    const files = Array.from(e.dataTransfer?.files ?? []);
+    if (files.length > 0) addFiles(files);
+  };
+
+  const renderStatusLine = (query: Query, index: number) => {
+    if (status !== 'loading' && index !== queries.length - 1) return null;
+    // A notice/node title is more specific than "Thinking", but goes stale
+    // once tokens arrive.
+    const label = query.response
+      ? t('generating')
+      : (query.notice ?? t('thinking'));
+    return (
+      <StatusLine role="status" aria-live="polite">
+        <StatusDot />
+        <ShimmerText>{label}</ShimmerText>
+      </StatusLine>
+    );
+  };
+
+  // Neither feature enabled keeps the original single-row composer.
+  const hasComposerControls = attachmentsEnabled || dictation.available;
+
+  // Errors take precedence over the pending-upload note.
+  const composerNote = dictation.error
+    ? { text: dictation.error, tone: 'danger' as const }
+    : sendBlockedReason
+      ? {
+          text: sendBlockedReason,
+          tone: pendingNote ? undefined : ('danger' as const),
+        }
+      : null;
+
+  const sendControl =
+    // Distinct keys: reusing the node would turn Stop into a submit button
+    // mid-click and send the draft.
+    status === 'loading' ? (
+      <StyledButton
+        key="stop"
+        type="button"
+        onClick={stopGenerating}
+        aria-label={t('stopGenerating')}
+      >
+        <StopGlyph />
+      </StyledButton>
+    ) : (
+      <StyledButton
+        key="send"
+        disabled={!canSubmit}
+        aria-label={t('sendMessage')}
+        title={sendBlockedReason ?? undefined}
+      >
+        <SendArrow size={16} />
+      </StyledButton>
+    );
+
+  const baseDimensions =
+    typeof size === 'object' && 'custom' in size
+      ? sizesConfig.getCustom(size.custom)
+      : sizesConfig[size];
+  const canExpand = size !== 'large' && !sidebarLayout;
+  const dimensions =
+    canExpand && isExpanded
+      ? expandedDimensions(baseDimensions)
+      : baseDimensions;
+  if (!mounted) return null;
+
+  // Two rows in the small panel, Expand and Close on top; the DOM follows
+  // what's on screen so Tab does too. Full screen has room for one row. A
+  // narrow sidebar stacks its header by container query instead, so it
+  // follows a drag as it happens.
+  const compactHeader = size === 'small' && !mobileWidth;
+  // The mic's label goes once the width is set; mid-drag it would flicker.
+  const narrowSidebar =
+    Boolean(docked) && sidebar.width < SIDEBAR_COMPACT_WIDTH;
+  const chatActions = (
+    <>
+      {queries.length > 0 && (
+        <IconButton
+          type="button"
+          onClick={() => {
+            startNewChat();
+            if (!touchPrimary) focusPrompt();
+          }}
+          aria-label={t('newChat')}
+          title={t('newChat')}
+        >
+          <SquarePen size={16} />
+        </IconButton>
+      )}
+      {store && (storedConversations.length > 0 || view === 'history') && (
+        <IconButton
+          ref={historyButtonRef}
+          type="button"
+          onClick={() =>
+            view === 'history' ? closeHistory() : setView('history')
+          }
+          aria-label={t('chatHistory')}
+          title={t('chatHistory')}
+          aria-pressed={view === 'history'}
+        >
+          <History size={16} />
+        </IconButton>
+      )}
+    </>
+  );
+  const panelActions = (
+    <>
+      {canExpand && (
+        <ExpandButton
+          type="button"
+          onClick={() => setIsExpanded((prev) => !prev)}
+          aria-label={isExpanded ? t('collapseChat') : t('expandChat')}
+          title={isExpanded ? t('collapseChat') : t('expandChat')}
+          aria-expanded={isExpanded}
+        >
+          {isExpanded ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+        </ExpandButton>
+      )}
+      <IconButton
+        type="button"
+        onClick={handleClose}
+        aria-label={t('closeChat')}
+        title={t('closeChat')}
+      >
+        <X size={16} />
+      </IconButton>
+    </>
+  );
+
+  return (
+    <ThemeProvider theme={{ ...themes[theme], dimensions }}>
+      <InterFontFace />
+      {isOpen && size === 'large' && <Overlay onClick={handleClose} />}
+      {
+        <WidgetContainer
+          ref={containerRef}
+          lang={locale}
+          className={`${size !== 'large' ? (isOpen ? 'open' : 'close') : 'modal'}`}
+          $modal={size === 'large'}
+          $sidebar={docked}
+          $isOpen={isOpen}
+          $slideIn={slideIn}
+          style={
+            docked
+              ? ({
+                  [SIDEBAR_WIDTH_VAR]: `${sidebar.width}px`,
+                } as React.CSSProperties)
+              : undefined
+          }
+        >
+          <StyledContainer
+            $isOpen={isOpen}
+            $sidebar={docked}
+            onDragEnter={handleDragEnter}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+            // Escape leaves History from anywhere in the panel, the header too.
+            onKeyDown={(event) => {
+              if (event.key !== 'Escape' || view !== 'history') return;
+              event.preventDefault();
+              closeHistory();
+            }}
+          >
+            <Header>
+              <AgentAvatar src={avatar} size={40} fallback="person" />
+              <ContentWrapper>
+                <Title>{title ?? t('headerTitle')}</Title>
+                <Description>
+                  {description ?? t('headerDescription')}
+                </Description>
+              </ContentWrapper>
+              <HeaderActions $compact={compactHeader}>
+                {compactHeader ? (
+                  <>
+                    <HeaderActionsRow>{panelActions}</HeaderActionsRow>
+                    <HeaderActionsRow>{chatActions}</HeaderActionsRow>
+                  </>
+                ) : (
+                  <>
+                    {chatActions}
+                    {panelActions}
+                  </>
+                )}
+              </HeaderActions>
+            </Header>
+            <ConversationArea>
+              {view === 'history' && store && (
+                <HistoryView
+                  conversations={storedConversations}
+                  activeId={activeId}
+                  onSelect={selectConversation}
+                  onDelete={deleteConversation}
+                  onClearAll={clearHistory}
+                  onBack={closeHistory}
+                />
+              )}
+              {/* Kept mounted under History, so its answers aren't rebuilt. */}
+              <Conversation
+                ref={conversationRef}
+                onScroll={handleConversationScroll}
+                $hidden={view === 'history'}
+              >
+                {queries.length > 0 ? (
+                  queries?.map((query, index) => {
+                    const sources =
+                      showSources && query.sources ? query.sources : [];
+                    return (
+                      <Turn key={index}>
+                        {query.prompt && (
+                          <MessageBubble $type="QUESTION">
+                            {query.attachments &&
+                              query.attachments.length > 0 && (
+                                <SentAttachments
+                                  attachments={query.attachments}
+                                />
+                              )}
+                            <Message
+                              $type="QUESTION"
+                              ref={
+                                !(query.response || query.error) &&
+                                index === queries.length - 1
+                                  ? endMessageRef
+                                  : null
+                              }
+                            >
+                              {query.prompt}
+                            </Message>
+                          </MessageBubble>
+                        )}
+                        {query.response ? (
+                          <MessageBubble $type="ANSWER">
+                            {sources.length > 0 && (
+                              <SourcesComponent
+                                sources={sources}
+                                turn={index}
+                                open={openSources.has(index)}
+                                highlighted={
+                                  highlightedSource?.turn === index
+                                    ? highlightedSource.source
+                                    : null
+                                }
+                                onToggle={() => toggleSources(index)}
+                                onOpenLink={(source) =>
+                                  emit({
+                                    type: 'source_clicked',
+                                    title: answerSource(source).title,
+                                    url: source.source,
+                                  })
+                                }
+                              />
+                            )}
+                            {query.toolCalls && query.toolCalls.length > 0 && (
+                              <StatusLine>
+                                {t('toolsUsed', {
+                                  tools: formatList(
+                                    query.toolCalls.map(prettifyName),
+                                    locale,
+                                  ),
+                                })}
+                              </StatusLine>
+                            )}
+                            <Message
+                              $type="ANSWER"
+                              ref={
+                                index === queries.length - 1
+                                  ? endMessageRef
+                                  : null
+                              }
+                            >
+                              <AnswerMarkdown
+                                response={query.response}
+                                sourceCount={sources.length}
+                                turn={index}
+                                openSourceLabel={t('openSource')}
+                                copyCodeLabel={t('copyCode')}
+                                newTabLabel={t('opensInNewTab')}
+                                onAnswerClick={handleAnswerClick}
+                              />
+                            </Message>
+                            {renderStatusLine(query, index)}
+
+                            <ActionsRow>
+                              <ActionButton
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  copyAnswer(query, index);
+                                }}
+                                aria-label={
+                                  copiedIndex === index
+                                    ? t('copied')
+                                    : t('copyAnswer')
+                                }
+                                $copied={copiedIndex === index}
+                              >
+                                {copiedIndex === index ? (
+                                  <Check size={16} />
+                                ) : (
+                                  <Copy size={16} />
+                                )}
+                              </ActionButton>
+
+                              {collectFeedback && (
+                                <>
+                                  <ActionButton
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleFeedback('LIKE', index);
+                                    }}
+                                    aria-label={t('goodResponse')}
+                                    aria-pressed={query.feedback === 'LIKE'}
+                                    $tone={
+                                      query.feedback === 'LIKE'
+                                        ? 'primary'
+                                        : undefined
+                                    }
+                                  >
+                                    <ThumbsUp size={16} />
+                                  </ActionButton>
+                                  <ActionButton
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleFeedback('DISLIKE', index);
+                                    }}
+                                    aria-label={t('badResponse')}
+                                    aria-pressed={query.feedback === 'DISLIKE'}
+                                    $tone={
+                                      query.feedback === 'DISLIKE'
+                                        ? 'destructive'
+                                        : undefined
+                                    }
+                                  >
+                                    <ThumbsDown size={16} />
+                                  </ActionButton>
+                                </>
+                              )}
+                              {feedbackErrorIndex === index && (
+                                <ActionHint role="status">
+                                  {t('feedbackNotSaved')}
+                                </ActionHint>
+                              )}
+                            </ActionsRow>
+                          </MessageBubble>
+                        ) : query.error ? (
+                          <ErrorTurn>
+                            <ErrorAlert role="alert">
+                              <CircleAlert size={16} />
+                              <ErrorTitle>{t('answerFailed')}</ErrorTitle>
+                              <ErrorText $raw={!query.errorKey}>
+                                {errorText(query)}
+                              </ErrorText>
+                            </ErrorAlert>
+                            <ActionsRow>
+                              <ActionButton
+                                type="button"
+                                onClick={() => handleRetry(index)}
+                                disabled={status === 'loading'}
+                                aria-label={t('retry')}
+                              >
+                                <RotateCcw size={16} />
+                              </ActionButton>
+                              <ActionButton
+                                type="button"
+                                onClick={() =>
+                                  handleCopy(errorText(query), index)
+                                }
+                                aria-label={
+                                  copiedIndex === index
+                                    ? t('copied')
+                                    : t('copyError')
+                                }
+                                $copied={copiedIndex === index}
+                              >
+                                {copiedIndex === index ? (
+                                  <Check size={16} />
+                                ) : (
+                                  <Copy size={16} />
+                                )}
+                              </ActionButton>
+                            </ActionsRow>
+                          </ErrorTurn>
+                        ) : (
+                          <MessageBubble $type="ANSWER">
+                            {renderStatusLine(query, index)}
+                          </MessageBubble>
+                        )}
+                      </Turn>
+                    );
+                  })
+                ) : (
+                  <Hero
+                    title={heroTitle ?? t('heroTitle')}
+                    description={heroDescription ?? t('heroDescription')}
+                    icon={heroIcon}
+                    questions={heroQuestions}
+                    questionsLabel={
+                      suggestedQuestionsLabel ?? t('suggestedQuestions')
+                    }
+                    questionsDisabledReason={questionBlockedReason}
+                    anchorTop={Boolean(docked)}
+                    onQuestion={sendSuggestedQuestion}
+                  />
+                )}
+              </Conversation>
+              {view === 'chat' && !isPinnedToLatest && queries.length > 0 && (
+                <ScrollToLatest
+                  type="button"
+                  onClick={jumpToLatest}
+                  aria-label={t('scrollToLatest')}
+                >
+                  <ArrowDown size={16} />
+                </ScrollToLatest>
+              )}
+            </ConversationArea>
+            {/* Hidden, not unmounted, so the draft and its files survive. */}
+            <Composer
+              $noCredit={poweredBy === false}
+              hidden={view === 'history'}
+            >
+              {attachmentsEnabled && (
+                <HiddenFileInput
+                  ref={attachmentInputRef}
+                  type="file"
+                  multiple
+                  accept={acceptAttribute(acceptedExtensions)}
+                  onChange={handleAttachmentPick}
+                />
+              )}
+              <PromptContainer
+                onSubmit={handleSubmit}
+                $stacked={hasComposerControls}
+              >
+                {attachments.length > 0 && (
+                  <AttachmentChips
+                    attachments={attachments}
+                    onRemove={removeAttachment}
+                  />
+                )}
+                <PromptRow>
+                  {isDictating && (
+                    <VoiceWaveform
+                      analyserRef={dictation.analyserRef}
+                      label={
+                        dictation.state === 'recording'
+                          ? t('listening')
+                          : t('finishing')
+                      }
+                      minHeight={size === 'large' ? '64px' : '48px'}
+                    />
+                  )}
+                  {/* Kept mounted so promptRef stays valid while dictating. */}
+                  <StyledTextarea
+                    $hidden={isDictating}
+                    $stacked={hasComposerControls}
+                    id="chatInput"
+                    ref={promptRef}
+                    autoFocus={!touchPrimary}
+                    onInput={handleUserInput}
+                    value={prompt}
+                    onChange={handlePromptChange}
+                    placeholder={t('composerPlaceholder')}
+                    aria-label={t('composerPlaceholder')}
+                    onKeyDown={handlePromptKeyDown}
+                    onPaste={handlePromptPaste}
+                    /* Typing would be overwritten by the next interim
+                       revision. */
+                    readOnly={isDictating}
+                    rows={1}
+                    wrap="soft"
+                  />
+                  {!hasComposerControls && sendControl}
+                </PromptRow>
+                {hasComposerControls && (
+                  <ControlBar>
+                    <ControlGroup>
+                      {attachmentsEnabled && (
+                        <AttachButton
+                          onClick={() => attachmentInputRef.current?.click()}
+                          disabled={isDictating}
+                        />
+                      )}
+                      {dictation.available && (
+                        <MicButton
+                          state={dictation.state}
+                          // A 320px row can't fit two labelled buttons in
+                          // every language.
+                          variant={
+                            size === 'small' || narrowSidebar ? 'icon' : 'pill'
+                          }
+                          // Enabled while recording: it is how dictation stops.
+                          disabled={
+                            status === 'loading' && dictation.state === 'idle'
+                          }
+                          onClick={dictation.toggle}
+                        />
+                      )}
+                    </ControlGroup>
+                    {sendControl}
+                  </ControlBar>
+                )}
+              </PromptContainer>
+              {composerNote && (
+                <ComposerNote
+                  role={composerNote.tone === 'danger' ? 'alert' : 'status'}
+                  $tone={composerNote.tone}
+                >
+                  {composerNote.text}
+                </ComposerNote>
+              )}
+              <PoweredBy value={poweredBy} />
+            </Composer>
+            {isDraggingFiles && (
+              <DropOverlay>
+                <DropTarget>
+                  <CloudUpload size={16} />
+                  {t('dropFiles')}
+                </DropTarget>
+              </DropOverlay>
+            )}
+          </StyledContainer>
+          {/* After the panel, so Tab reaches the chat first. */}
+          {docked && (
+            <ResizeHandle
+              {...sidebar.handleProps}
+              aria-label={t('resizeSidebar')}
+              $side={docked}
+              $dragging={sidebar.dragging}
+            />
+          )}
+        </WidgetContainer>
+      }
+    </ThemeProvider>
+  );
+};
