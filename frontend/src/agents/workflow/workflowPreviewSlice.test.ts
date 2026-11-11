@@ -1,0 +1,242 @@
+import { describe, expect, it } from 'vitest';
+
+import { Attachment } from '../../upload/uploadSlice';
+import reducer, {
+  addQuery,
+  clearQueryRun,
+  collectCompletedAttachmentIds,
+  collectRunAttachmentIds,
+  previewSendBlockReason,
+  resetWorkflowPreview,
+  setPreviewOpen,
+  setWorkflowRunId,
+  UNSAVED_DRAFT_ATTACHMENTS_MESSAGE,
+  updateExecutionStep,
+  updateLoopItem,
+} from './workflowPreviewSlice';
+
+const seedState = () => reducer(undefined, { type: '@@INIT' });
+
+const att = (over: Partial<Attachment>): Attachment => ({
+  id: 'a1',
+  fileName: 'f.pdf',
+  progress: 100,
+  status: 'completed',
+  taskId: 't1',
+  ...over,
+});
+
+describe('collectCompletedAttachmentIds', () => {
+  it('returns ids of completed attachments only', () => {
+    const ids = collectCompletedAttachmentIds([
+      att({ id: 'done', status: 'completed' }),
+      att({ id: 'busy', status: 'processing' }),
+      att({ id: 'up', status: 'uploading' }),
+      att({ id: 'bad', status: 'failed' }),
+    ]);
+    expect(ids).toEqual(['done']);
+  });
+
+  it('sends the server id, not the client placeholder', () => {
+    expect(
+      collectCompletedAttachmentIds([
+        att({ id: '1700000000000-abc', attachmentId: 'srv-1' }),
+      ]),
+    ).toEqual(['srv-1']);
+  });
+
+  it('drops completed rows with no server id and returns [] when none', () => {
+    expect(
+      collectCompletedAttachmentIds([att({ id: '', status: 'completed' })]),
+    ).toEqual([]);
+    expect(collectCompletedAttachmentIds([])).toEqual([]);
+  });
+});
+
+describe('collectRunAttachmentIds', () => {
+  const completed = [att({ id: 'done', status: 'completed' })];
+
+  it('returns completed ids for a saved workflow', () => {
+    expect(collectRunAttachmentIds(completed, 'wf-1')).toEqual(['done']);
+  });
+
+  it('returns [] for an unsaved draft so uploads are neither sent nor cleared', () => {
+    expect(collectRunAttachmentIds(completed, null)).toEqual([]);
+    expect(collectRunAttachmentIds(completed, undefined)).toEqual([]);
+    expect(collectRunAttachmentIds(completed, '')).toEqual([]);
+  });
+});
+
+describe('previewSendBlockReason', () => {
+  it('blocks an unsaved draft that has completed attachments', () => {
+    expect(previewSendBlockReason(null, true)).toBe(
+      UNSAVED_DRAFT_ATTACHMENTS_MESSAGE,
+    );
+    expect(previewSendBlockReason(undefined, true)).toBe(
+      UNSAVED_DRAFT_ATTACHMENTS_MESSAGE,
+    );
+    expect(previewSendBlockReason('', true)).toBe(
+      UNSAVED_DRAFT_ATTACHMENTS_MESSAGE,
+    );
+  });
+
+  it('allows a saved workflow, or an unsaved draft with no attachments', () => {
+    expect(previewSendBlockReason('wf-1', true)).toBeNull();
+    expect(previewSendBlockReason('wf-1', false)).toBeNull();
+    expect(previewSendBlockReason(null, false)).toBeNull();
+  });
+});
+
+describe('setWorkflowRunId', () => {
+  it('stores the run id on the addressed query', () => {
+    let state = seedState();
+    state = reducer(state, addQuery({ prompt: 'run it' }));
+    state = reducer(
+      state,
+      setWorkflowRunId({ index: 0, workflowRunId: 'run-1' }),
+    );
+    expect(state.queries[0].workflowRunId).toBe('run-1');
+  });
+
+  it('records whether the run is saved', () => {
+    let state = seedState();
+    state = reducer(state, addQuery({ prompt: 'draft' }));
+    state = reducer(
+      state,
+      setWorkflowRunId({ index: 0, workflowRunId: 'run-2', saved: false }),
+    );
+    expect(state.queries[0].workflowRunSaved).toBe(false);
+  });
+
+  it('ignores an out-of-range index without throwing', () => {
+    let state = seedState();
+    state = reducer(state, addQuery({ prompt: 'q' }));
+    state = reducer(
+      state,
+      setWorkflowRunId({ index: 5, workflowRunId: 'run-x' }),
+    );
+    expect(state.queries[0].workflowRunId).toBeUndefined();
+  });
+});
+
+describe('setPreviewOpen', () => {
+  it('defaults to closed and toggles the preview-open flag', () => {
+    let state = seedState();
+    expect(state.previewOpen).toBe(false);
+    state = reducer(state, setPreviewOpen(true));
+    expect(state.previewOpen).toBe(true);
+    state = reducer(state, setPreviewOpen(false));
+    expect(state.previewOpen).toBe(false);
+  });
+
+  it('survives a resetWorkflowPreview so the overlay flag stays set', () => {
+    let state = seedState();
+    state = reducer(state, setPreviewOpen(true));
+    state = reducer(state, addQuery({ prompt: 'q' }));
+    state = reducer(state, resetWorkflowPreview());
+    expect(state.queries).toEqual([]);
+    expect(state.previewOpen).toBe(true);
+  });
+});
+
+describe('updateLoopItem', () => {
+  it('counts items on the loop step and keeps them when the step ends', () => {
+    let state = reducer(seedState(), addQuery({ prompt: 'q' }));
+    const loopStep = {
+      nodeId: 'each',
+      nodeType: 'loop',
+      nodeTitle: 'Each',
+    };
+    state = reducer(
+      state,
+      updateExecutionStep({
+        index: 0,
+        step: { ...loopStep, status: 'running' },
+      }),
+    );
+    state = reducer(
+      state,
+      updateLoopItem({ index: 0, nodeId: 'each', total: 2, failed: false }),
+    );
+    state = reducer(
+      state,
+      updateLoopItem({ index: 0, nodeId: 'each', total: 2, failed: true }),
+    );
+    state = reducer(
+      state,
+      updateExecutionStep({
+        index: 0,
+        step: { ...loopStep, status: 'completed' },
+      }),
+    );
+
+    const expected = { total: 2, done: 2, failed: 1 };
+    expect(state.queries[0].executionSteps?.[0].items).toEqual(expected);
+    expect(state.executionSteps[0].items).toEqual(expected);
+
+    // A retry of the same query starts its steps and counts over.
+    state = reducer(state, clearQueryRun({ index: 0 }));
+    expect(state.queries[0].executionSteps).toEqual([]);
+    expect(state.executionSteps).toEqual([]);
+  });
+});
+
+describe('step retries', () => {
+  const agentStep = { nodeId: 'a', nodeType: 'agent', nodeTitle: 'Agent' };
+
+  it('marks a retrying step, then counts its attempts when it ends', () => {
+    let state = reducer(seedState(), addQuery({ prompt: 'q' }));
+    state = reducer(
+      state,
+      updateExecutionStep({
+        index: 0,
+        step: { ...agentStep, status: 'running' },
+      }),
+    );
+    const startedAt = state.executionSteps[0].startedAt;
+    state = reducer(
+      state,
+      updateExecutionStep({
+        index: 0,
+        step: {
+          ...agentStep,
+          status: 'running',
+          attempt: 2,
+          maxAttempts: 3,
+          retryError: 'upstream 503',
+        },
+      }),
+    );
+    expect(state.executionSteps[0]).toMatchObject({
+      status: 'running',
+      startedAt,
+      attempt: 2,
+      maxAttempts: 3,
+      retryError: 'upstream 503',
+    });
+
+    state = reducer(
+      state,
+      updateExecutionStep({
+        index: 0,
+        step: { ...agentStep, status: 'completed', attempts: 2 },
+      }),
+    );
+    const ended = state.queries[0].executionSteps![0];
+    expect(ended.attempts).toBe(2);
+    expect(ended.attempt).toBeUndefined();
+    expect(ended.retryError).toBeUndefined();
+  });
+
+  it('says nothing of attempts for a step that ran once', () => {
+    let state = reducer(seedState(), addQuery({ prompt: 'q' }));
+    state = reducer(
+      state,
+      updateExecutionStep({
+        index: 0,
+        step: { ...agentStep, status: 'completed', attempts: 1 },
+      }),
+    );
+    expect(state.executionSteps[0].attempts).toBeUndefined();
+  });
+});

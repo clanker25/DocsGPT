@@ -1,0 +1,545 @@
+"""Repository for ``webhook_dedup`` and ``task_dedup``; 24h TTL enforced at read."""
+
+from __future__ import annotations
+
+import json
+from typing import Any, Optional
+
+from sqlalchemy import Connection, text
+
+from docsgpt.storage.db.base_repository import row_to_dict
+from docsgpt.storage.db.serialization import PGNativeJSONEncoder
+
+# 24h TTL is the contract surfaced in the upload/webhook docstrings; the
+# read filters and the stale-row replacement predicate must agree, or the
+# upsert can fall into a window where the row is "fresh" to the writer
+# but "expired" to the reader (or vice versa). Keep one constant so any
+# future change moves both directions in lockstep.
+DEDUP_TTL_INTERVAL = "24 hours"
+
+# A pending task row ages from its last lease heartbeat, not from
+# ``created_at``: while its lease is live, or lapsed within the TTL, the row
+# still guards a task that runs (or waits) past the TTL. Read, claim and
+# cleanup share this predicate so none of them drops a row the others keep.
+_TASK_LEASE_HELD = """(
+    task_dedup.status = 'pending'
+    AND task_dedup.lease_expires_at IS NOT NULL
+    AND task_dedup.lease_expires_at > now() - CAST(:ttl AS interval)
+)"""
+
+
+# A task row whose work is still ahead or under way: queued and not started
+# yet (a fresh claim, or one reset for a resume), or running with a live lease
+# (or one lapsed by less than :lease_grace seconds, a missed heartbeat). A row
+# whose last attempt raised has its lease released, so a task waiting out a
+# retry, or out of retries, does not count; neither does a finished one.
+_TASK_IN_FLIGHT = """(
+    t.status = 'pending'
+    AND (
+        t.lease_expires_at > now() - make_interval(secs => :lease_grace)
+        OR (t.lease_expires_at IS NULL
+            AND t.attempt_count = 0
+            AND t.created_at > now() - CAST(:ttl AS interval))
+    )
+)"""
+
+# ``task_name`` of the rows that point a user's remote source at its ingest.
+IN_FLIGHT_MARKER = "ingest_in_flight"
+
+
+def _jsonb(value: Any) -> Any:
+    if value is None:
+        return None
+    return json.dumps(value, cls=PGNativeJSONEncoder)
+
+
+class IdempotencyRepository:
+    def __init__(self, conn: Connection) -> None:
+        self._conn = conn
+
+    # --- webhook_dedup -----------------------------------------------------
+
+    def get_webhook(self, key: str) -> Optional[dict]:
+        """Return the cached webhook row for ``key`` if still within the 24h window."""
+        row = self._conn.execute(
+            text(
+                """
+                SELECT * FROM webhook_dedup
+                WHERE idempotency_key = :key
+                  AND created_at > now() - CAST(:ttl AS interval)
+                """
+            ),
+            {"key": key, "ttl": DEDUP_TTL_INTERVAL},
+        ).fetchone()
+        return row_to_dict(row) if row is not None else None
+
+    def record_webhook(
+        self,
+        key: str,
+        agent_id: str,
+        task_id: str,
+        response_json: dict,
+    ) -> Optional[dict]:
+        """Insert a webhook dedup row; return None if another writer raced and won.
+
+        ``ON CONFLICT`` replaces an existing row only when its ``created_at``
+        is past TTL — atomic stale-row recycling under the row lock. A
+        within-TTL conflict yields no row; the caller resolves it via
+        :meth:`get_webhook`.
+        """
+        result = self._conn.execute(
+            text(
+                """
+                INSERT INTO webhook_dedup (
+                    idempotency_key, agent_id, task_id, response_json
+                )
+                VALUES (
+                    :key, CAST(:agent_id AS uuid), :task_id,
+                    CAST(:response_json AS jsonb)
+                )
+                ON CONFLICT (idempotency_key) DO UPDATE
+                   SET agent_id      = EXCLUDED.agent_id,
+                       task_id       = EXCLUDED.task_id,
+                       response_json = EXCLUDED.response_json,
+                       created_at    = now()
+                   WHERE webhook_dedup.created_at
+                         <= now() - CAST(:ttl AS interval)
+                RETURNING *
+                """
+            ),
+            {
+                "key": key,
+                "agent_id": agent_id,
+                "task_id": task_id,
+                "response_json": _jsonb(response_json),
+                "ttl": DEDUP_TTL_INTERVAL,
+            },
+        )
+        row = result.fetchone()
+        return row_to_dict(row) if row is not None else None
+
+    # --- task_dedup --------------------------------------------------------
+
+    def get_task(self, key: str) -> Optional[dict]:
+        """Return the task row for ``key`` if within the 24h window or its lease is still held."""
+        row = self._conn.execute(
+            text(
+                f"""
+                SELECT * FROM task_dedup
+                WHERE idempotency_key = :key
+                  AND (created_at > now() - CAST(:ttl AS interval)
+                       OR {_TASK_LEASE_HELD})
+                """
+            ),
+            {"key": key, "ttl": DEDUP_TTL_INTERVAL},
+        ).fetchone()
+        return row_to_dict(row) if row is not None else None
+
+    def claim_task(
+        self,
+        key: str,
+        task_name: str,
+        task_id: str,
+    ) -> Optional[dict]:
+        """Claim ``key`` for this task. Returns the inserted row, or None if
+        another writer raced and won. The HTTP entry must call this *before*
+        ``.delay()`` so only the winner enqueues the Celery task.
+
+        ``ON CONFLICT`` replaces an existing row in two cases:
+
+        - **status='failed'**: the worker's poison-loop guard or the
+          reconciler's stuck-pending sweep finalised the prior attempt
+          as failed. Both explicitly intend a same-key retry to re-run
+          (see ``run_reconciliation`` Q5 docstring) — letting the row
+          block for 24 h would silently undo that intent.
+        - **created_at past TTL**: a stale claim from any status no
+          longer represents a meaningful dedup signal — unless it is a
+          pending row whose lease is live or lapsed within the TTL: its
+          task is still running (or was, recently), so the row keeps its
+          task id and ``attempt_count``.
+
+        ``status='completed'`` rows still block within TTL — that's the
+        cached-success contract callers rely on. ``status='pending'``
+        rows still block within TTL so concurrent same-key requests
+        collapse onto the in-flight task. Result/attempt fields are
+        reset to their fresh-claim defaults during replacement.
+        """
+        result = self._conn.execute(
+            text(
+                f"""
+                INSERT INTO task_dedup (
+                    idempotency_key, task_name, task_id, result_json, status
+                )
+                VALUES (
+                    :key, :task_name, :task_id, NULL, 'pending'
+                )
+                ON CONFLICT (idempotency_key) DO UPDATE
+                   SET task_name     = EXCLUDED.task_name,
+                       task_id       = EXCLUDED.task_id,
+                       result_json   = NULL,
+                       status        = 'pending',
+                       attempt_count = 0,
+                       created_at    = now()
+                   WHERE task_dedup.status = 'failed'
+                      OR (task_dedup.created_at
+                              <= now() - CAST(:ttl AS interval)
+                          AND NOT {_TASK_LEASE_HELD})
+                RETURNING *
+                """
+            ),
+            {
+                "key": key,
+                "task_name": task_name,
+                "task_id": task_id,
+                "ttl": DEDUP_TTL_INTERVAL,
+            },
+        )
+        row = result.fetchone()
+        return row_to_dict(row) if row is not None else None
+
+    def try_claim_lease(
+        self,
+        key: str,
+        task_name: str,
+        task_id: str,
+        owner_id: str,
+        ttl_seconds: int = 60,
+    ) -> Optional[int]:
+        """Atomically claim the running lease for ``key``.
+
+        Returns the new ``attempt_count`` if this caller now owns the
+        lease (fresh insert OR existing row whose lease was empty/expired),
+        or ``None`` if a different worker holds a live lease.
+
+        The conflict path also bumps ``attempt_count`` so the
+        poison-loop guard in :func:`with_idempotency` can fire after
+        :data:`MAX_TASK_ATTEMPTS` reclaims. ``status='completed'`` rows
+        are deliberately untouched — :func:`_lookup_completed` is the
+        cache short-circuit and runs before this. Uses
+        ``clock_timestamp()`` so a same-transaction refresh actually
+        moves the expiry forward (``now()`` is frozen at txn start).
+        """
+        result = self._conn.execute(
+            text(
+                """
+                INSERT INTO task_dedup (
+                    idempotency_key, task_name, task_id, status, attempt_count,
+                    lease_owner_id, lease_expires_at
+                ) VALUES (
+                    :key, :task_name, :task_id, 'pending', 1,
+                    :owner,
+                    clock_timestamp() + make_interval(secs => :ttl)
+                )
+                ON CONFLICT (idempotency_key) DO UPDATE
+                   SET attempt_count    = task_dedup.attempt_count + 1,
+                       task_name        = EXCLUDED.task_name,
+                       lease_owner_id   = EXCLUDED.lease_owner_id,
+                       lease_expires_at = EXCLUDED.lease_expires_at
+                   WHERE task_dedup.status <> 'completed'
+                     AND (task_dedup.lease_expires_at IS NULL
+                          OR task_dedup.lease_expires_at <= clock_timestamp())
+                RETURNING attempt_count
+                """
+            ),
+            {
+                "key": key,
+                "task_name": task_name,
+                "task_id": task_id,
+                "owner": owner_id,
+                "ttl": int(ttl_seconds),
+            },
+        )
+        row = result.fetchone()
+        return int(row[0]) if row is not None else None
+
+    def refresh_lease(
+        self,
+        key: str,
+        owner_id: str,
+        ttl_seconds: int = 60,
+    ) -> bool:
+        """Bump ``lease_expires_at`` if this caller still owns the lease.
+
+        Returns False when ownership was lost (lease stolen by another
+        worker after expiry, or row finalised). The heartbeat thread
+        logs that as a warning but doesn't try to abort the running
+        task — at-most-one-worker is bounded by ``ttl_seconds``, the
+        damage from a brief overlap window is unavoidable in this case.
+        """
+        result = self._conn.execute(
+            text(
+                """
+                UPDATE task_dedup
+                SET lease_expires_at =
+                        clock_timestamp() + make_interval(secs => :ttl)
+                WHERE idempotency_key = :key
+                  AND lease_owner_id = :owner
+                  AND status = 'pending'
+                """
+            ),
+            {
+                "key": key,
+                "owner": owner_id,
+                "ttl": int(ttl_seconds),
+            },
+        )
+        return result.rowcount > 0
+
+    def live_lease_keys(self, keys: list[str]) -> set[str]:
+        """The keys among ``keys`` whose task holds a live lease right now.
+
+        A live lease means a worker is running the task and its heartbeat
+        is current, so a sweep must not treat the task as lost.
+
+        Args:
+            keys: Idempotency keys to look up.
+
+        Returns:
+            The subset with a pending row and an unexpired lease.
+        """
+        if not keys:
+            return set()
+        result = self._conn.execute(
+            text(
+                """
+                SELECT idempotency_key FROM task_dedup
+                WHERE idempotency_key = ANY(:keys)
+                  AND status = 'pending'
+                  AND lease_expires_at > clock_timestamp()
+                """
+            ),
+            {"keys": list(keys)},
+        )
+        return {row[0] for row in result.fetchall()}
+
+    def reset_for_resume(self, key: str, task_id: str) -> bool:
+        """Give a task the reconciler queues again a fresh attempt budget.
+
+        Only a pending row with no live lease is reset: its runs died (a
+        restart killed them), so their claims say nothing about the resumed
+        task. The reconciler counts resumes itself. ``task_id`` is the id the
+        resume runs under, which a same-key request is handed. ``created_at``
+        restarts too: with the lease cleared, an old row would otherwise be
+        past the TTL, so cleanup could drop it or a same-key claim replace it
+        before the resumed task takes the lease.
+
+        Args:
+            key: The task's idempotency key.
+            task_id: The resumed task's Celery id.
+
+        Returns:
+            ``True`` when a row was reset.
+        """
+        result = self._conn.execute(
+            text(
+                """
+                UPDATE task_dedup
+                SET attempt_count    = 0,
+                    task_id          = :task_id,
+                    created_at       = now(),
+                    lease_owner_id   = NULL,
+                    lease_expires_at = NULL
+                WHERE idempotency_key = :key
+                  AND status = 'pending'
+                  AND (lease_expires_at IS NULL
+                       OR lease_expires_at <= clock_timestamp())
+                """
+            ),
+            {"key": key, "task_id": task_id},
+        )
+        return result.rowcount > 0
+
+    def claim_in_flight_ingest(
+        self,
+        key: str,
+        *,
+        task_key: str,
+        task_id: str,
+        source_id: str,
+        lease_grace_seconds: int = 60,
+    ) -> Optional[dict]:
+        """Point ``key`` at the ingest about to be queued, unless the one it points at is in flight.
+
+        ``key`` names one user's remote source (its normalised address). The
+        row it writes is a marker, never run or leased itself: it holds the
+        ingest's own ``task_dedup`` key, and that row says whether the ingest
+        is still in flight. A marker pointing at a finished, failed or dead
+        ingest is replaced, so only a live one blocks a fresh submit.
+
+        Args:
+            key: The marker key.
+            task_key: The ``task_dedup`` key the new ingest runs under; its
+                row must exist (claimed) before this is called.
+            task_id: The new ingest's Celery task id.
+            source_id: The source id the new ingest was given.
+            lease_grace_seconds: How long past its lease a running ingest
+                still counts as in flight.
+
+        Returns:
+            The marker row, or ``None`` when the ingest already marked is in flight.
+        """
+        pointer = {"task_key": task_key, "source_id": str(source_id)}
+        result = self._conn.execute(
+            text(
+                f"""
+                INSERT INTO task_dedup (
+                    idempotency_key, task_name, task_id, result_json, status
+                )
+                VALUES (
+                    :key, :marker, :task_id, CAST(:pointer AS jsonb), 'pending'
+                )
+                ON CONFLICT (idempotency_key) DO UPDATE
+                   SET task_id     = EXCLUDED.task_id,
+                       result_json = EXCLUDED.result_json,
+                       created_at  = now()
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM task_dedup t
+                       WHERE t.idempotency_key = task_dedup.result_json ->> 'task_key'
+                         AND {_TASK_IN_FLIGHT}
+                   )
+                RETURNING *
+                """
+            ),
+            {
+                "key": key,
+                "marker": IN_FLIGHT_MARKER,
+                "task_id": task_id,
+                "pointer": _jsonb(pointer),
+                "lease_grace": int(lease_grace_seconds),
+                "ttl": DEDUP_TTL_INTERVAL,
+            },
+        )
+        row = result.fetchone()
+        return row_to_dict(row) if row is not None else None
+
+    def in_flight_ingest(self, key: str, *, lease_grace_seconds: int = 60) -> Optional[dict]:
+        """The ingest the marker ``key`` points at, while it is in flight.
+
+        Args:
+            key: The marker key.
+            lease_grace_seconds: As in :meth:`claim_in_flight_ingest`.
+
+        Returns:
+            ``{"task_id", "source_id"}`` (the task id the ingest runs under
+            now), or ``None``.
+        """
+        row = self._conn.execute(
+            text(
+                f"""
+                SELECT t.task_id, m.result_json ->> 'source_id' AS source_id
+                FROM task_dedup m
+                JOIN task_dedup t ON t.idempotency_key = m.result_json ->> 'task_key'
+                WHERE m.idempotency_key = :key
+                  AND m.task_name = :marker
+                  AND {_TASK_IN_FLIGHT}
+                """
+            ),
+            {
+                "key": key,
+                "marker": IN_FLIGHT_MARKER,
+                "lease_grace": int(lease_grace_seconds),
+                "ttl": DEDUP_TTL_INTERVAL,
+            },
+        ).fetchone()
+        return row_to_dict(row) if row is not None else None
+
+    def release_lease(self, key: str, owner_id: str) -> bool:
+        """Clear ``lease_owner_id`` / ``lease_expires_at`` on the
+        wrapper's exception path so Celery's autoretry_for doesn't have
+        to wait the full ``ttl_seconds`` before the next worker can
+        re-claim. No-op if a different worker has since taken over the
+        lease — that case is benign (we'd just be acknowledging we
+        weren't the owner anymore).
+        """
+        result = self._conn.execute(
+            text(
+                """
+                UPDATE task_dedup
+                SET lease_owner_id   = NULL,
+                    lease_expires_at = NULL
+                WHERE idempotency_key = :key
+                  AND lease_owner_id = :owner
+                  AND status = 'pending'
+                """
+            ),
+            {"key": key, "owner": owner_id},
+        )
+        return result.rowcount > 0
+
+    def finalize_task(
+        self,
+        key: str,
+        *,
+        result_json: Optional[dict],
+        status: str,
+    ) -> bool:
+        """Promote ``status='pending'`` → ``completed|failed`` with the
+        recorded result. Also clears the lease columns so a stale
+        ``lease_expires_at`` doesn't show up in operator dashboards.
+        No-op if the row is already terminal — preserves the first
+        writer's outcome on a crash + retry.
+        """
+        if status not in ("completed", "failed"):
+            raise ValueError(f"finalize_task: invalid status {status!r}")
+        result = self._conn.execute(
+            text(
+                """
+                UPDATE task_dedup
+                SET status           = :status,
+                    result_json      = CAST(:result_json AS jsonb),
+                    lease_owner_id   = NULL,
+                    lease_expires_at = NULL
+                WHERE idempotency_key = :key
+                  AND status = 'pending'
+                """
+            ),
+            {
+                "key": key,
+                "status": status,
+                "result_json": _jsonb(result_json),
+            },
+        )
+        return result.rowcount > 0
+
+    # --- housekeeping ------------------------------------------------------
+
+    def cleanup_expired(self) -> dict:
+        """Delete rows past TTL from both dedup tables; return per-table counts.
+
+        The TTL-aware upserts already prevent stale rows from blocking new
+        work, so this is purely housekeeping — bounds table growth and
+        keeps test isolation cheap. Safe to run concurrently with other
+        writers: a same-key INSERT racing the DELETE will either find no
+        row (acts as a fresh insert) or find a fresh row (re-created
+        between DELETE and conflict-check), neither of which is wrong.
+
+        A pending ``task_dedup`` row ages from its last lease heartbeat, not
+        from ``created_at``: a task that runs (or waits) past the TTL keeps
+        its row, so a broker redelivery finds the live lease instead of
+        starting a second copy, and a crashed run's ``attempt_count`` still
+        reaches the poison guard.
+        """
+        task_deleted = self._conn.execute(
+            text(
+                f"""
+                DELETE FROM task_dedup
+                WHERE created_at <= now() - CAST(:ttl AS interval)
+                  AND NOT {_TASK_LEASE_HELD}
+                """
+            ),
+            {"ttl": DEDUP_TTL_INTERVAL},
+        ).rowcount
+        webhook_deleted = self._conn.execute(
+            text(
+                """
+                DELETE FROM webhook_dedup
+                WHERE created_at <= now() - CAST(:ttl AS interval)
+                """
+            ),
+            {"ttl": DEDUP_TTL_INTERVAL},
+        ).rowcount
+        return {
+            "task_dedup_deleted": int(task_deleted or 0),
+            "webhook_dedup_deleted": int(webhook_deleted or 0),
+        }
+

