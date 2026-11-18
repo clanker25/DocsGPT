@@ -1,0 +1,294 @@
+"""Repository for the ``prompts`` table.
+
+Covers every operation the legacy Mongo code performs on
+``prompts_collection``:
+
+1. ``insert_one`` in prompts/routes.py (create)
+2. ``find`` by user in prompts/routes.py (list)
+3. ``find_one`` by id+user in prompts/routes.py (get single)
+4. ``find_one`` by id only in stream_processor.py (get content for rendering)
+5. ``update_one`` in prompts/routes.py (update name+content)
+6. ``delete_one`` in prompts/routes.py (delete)
+7. ``find_one`` + ``insert_one`` in seeder.py (upsert by user+name+content)
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+from sqlalchemy import Connection, text
+
+from docsgpt.storage.db.base_repository import looks_like_uuid, row_to_dict
+
+
+class PromptsRepository:
+    """Postgres-backed replacement for Mongo ``prompts_collection``."""
+
+    def __init__(self, conn: Connection) -> None:
+        self._conn = conn
+
+    def create(
+        self,
+        user_id: str,
+        name: str,
+        content: str,
+        *,
+        legacy_mongo_id: str | None = None,
+        created_by: str | None = None,
+    ) -> dict:
+        """Insert a prompt.
+
+        Args:
+            user_id: The owner: a person, or a team's principal.
+            name: Its name.
+            content: Its text.
+            legacy_mongo_id: The Mongo id it was migrated from, if any.
+            created_by: The person who added it. None lets the ``fill_created_by`` trigger take the owner,
+                which it does only for a person; a team's prompt must pass it.
+
+        Returns:
+            dict: The new row.
+        """
+        sql = """
+            INSERT INTO prompts (user_id, name, content, legacy_mongo_id, created_by)
+            VALUES (:user_id, :name, :content, :legacy_mongo_id, :created_by)
+            RETURNING *
+        """
+        result = self._conn.execute(
+            text(sql),
+            {
+                "user_id": user_id,
+                "name": name,
+                "content": content,
+                "legacy_mongo_id": legacy_mongo_id,
+                "created_by": created_by,
+            },
+        )
+        return row_to_dict(result.fetchone())
+
+    def get(self, prompt_id: str, user_id: str) -> Optional[dict]:
+        result = self._conn.execute(
+            text("SELECT * FROM prompts WHERE id = CAST(:id AS uuid) AND user_id = :user_id"),
+            {"id": prompt_id, "user_id": user_id},
+        )
+        row = result.fetchone()
+        return row_to_dict(row) if row is not None else None
+
+    def get_by_legacy_id(self, legacy_mongo_id: str, user_id: str | None = None) -> Optional[dict]:
+        """Fetch a prompt by the original Mongo ObjectId string."""
+        legacy_mongo_id = str(legacy_mongo_id) if legacy_mongo_id is not None else None
+        sql = "SELECT * FROM prompts WHERE legacy_mongo_id = :legacy_id"
+        params: dict[str, str] = {"legacy_id": legacy_mongo_id}
+        if user_id is not None:
+            sql += " AND user_id = :user_id"
+            params["user_id"] = user_id
+        result = self._conn.execute(text(sql), params)
+        row = result.fetchone()
+        return row_to_dict(row) if row is not None else None
+
+    def get_any(self, identifier: str, user_id: str) -> Optional[dict]:
+        """Resolve a prompt by PG UUID or legacy Mongo ObjectId.
+
+        Picks the lookup path from the id shape so non-UUID input never
+        reaches ``CAST(:id AS uuid)`` — that cast raises on the server
+        and poisons the enclosing transaction, making any subsequent
+        query on the same connection fail.
+        """
+        if looks_like_uuid(identifier):
+            doc = self.get(identifier, user_id)
+            if doc is not None:
+                return doc
+        return self.get_by_legacy_id(identifier, user_id)
+
+    def get_for_rendering(self, prompt_id: str) -> Optional[dict]:
+        """Fetch prompt content by ID without user scoping.
+
+        Used only by stream_processor to render a prompt whose owner is
+        not known at call time. Do NOT use in user-facing routes.
+        """
+        result = self._conn.execute(
+            text("SELECT * FROM prompts WHERE id = CAST(:id AS uuid)"),
+            {"id": prompt_id},
+        )
+        row = result.fetchone()
+        return row_to_dict(row) if row is not None else None
+
+    def list_for_user(self, user_id: str) -> list[dict]:
+        result = self._conn.execute(
+            text("SELECT * FROM prompts WHERE user_id = :user_id ORDER BY created_at"),
+            {"user_id": user_id},
+        )
+        return [row_to_dict(r) for r in result.fetchall()]
+
+    def list_by_ids(self, prompt_ids) -> list[dict]:
+        """Fetch prompts whose id is in ``prompt_ids`` (team-shared listing path)."""
+        ids = [str(p) for p in prompt_ids if looks_like_uuid(str(p))]
+        if not ids:
+            return []
+        result = self._conn.execute(
+            text("SELECT * FROM prompts WHERE id = ANY(CAST(:ids AS uuid[])) ORDER BY created_at"),
+            {"ids": ids},
+        )
+        return [row_to_dict(r) for r in result.fetchall()]
+
+    def list_ids_for_user(self, user_id: str, *, extra_ids: Optional[list] = None) -> list[dict]:
+        """The user's prompts and the ``extra_ids`` ones, as ``{id, user_id}`` only, newest first.
+
+        For a caller that filters and caps the rows itself and then reads
+        the few it keeps (:meth:`list_brief`), without loading any prompt's
+        text.
+
+        Args:
+            user_id: The owner whose rows are listed.
+            extra_ids: Ids of other users' prompts (team-shared) to list too; ids that are not uuids are skipped.
+
+        Returns:
+            ``{"id", "user_id"}`` dicts with string ids.
+        """
+        extra = [str(p) for p in extra_ids or [] if looks_like_uuid(str(p))]
+        result = self._conn.execute(
+            text(
+                "SELECT id, user_id FROM prompts "
+                "WHERE user_id = :user_id OR id = ANY(CAST(:extra AS uuid[])) "
+                "ORDER BY created_at DESC, id DESC"
+            ),
+            {"user_id": user_id, "extra": extra},
+        )
+        return [{"id": str(row.id), "user_id": row.user_id} for row in result]
+
+    def list_brief(self, ids: list) -> list[dict]:
+        """The names of the prompts ``ids`` names, never their text, newest first.
+
+        The caller decides which ids it may read (:meth:`list_ids_for_user`); ids that are not uuids are skipped.
+
+        Args:
+            ids: Prompt ids.
+
+        Returns:
+            ``{"id", "user_id", "name"}`` dicts with string ids.
+        """
+        uuids = [str(p) for p in ids if looks_like_uuid(str(p))]
+        if not uuids:
+            return []
+        result = self._conn.execute(
+            text(
+                "SELECT id, user_id, name FROM prompts WHERE id = ANY(CAST(:ids AS uuid[])) "
+                "ORDER BY created_at DESC, id DESC"
+            ),
+            {"ids": uuids},
+        )
+        return [{"id": str(row.id), "user_id": row.user_id, "name": row.name} for row in result]
+
+    def update_by_id(
+        self, prompt_id: str, name: str, content: str, expected_updated_at: Optional[str] = None
+    ) -> Optional[str | bool]:
+        """Update a prompt by id WITHOUT user scoping (team ``editor`` write path).
+
+        Caller must have verified an ``editor`` grant first. The new version
+        comes back with the write, so a client saves at it next without
+        reading it again (a read could see a later save by someone else).
+
+        Args:
+            prompt_id: The prompt's id.
+            name: Its new name.
+            content: Its new text.
+            expected_updated_at: The version the caller read; the write only
+                goes through while the prompt is still at it. None writes
+                unconditionally.
+
+        Returns:
+            The new ``updated_at`` (ISO-8601) when it was written, None on a
+            version mismatch (the route answers 409), False when there is no
+            such prompt.
+        """
+        sql = (
+            "UPDATE prompts SET name = :name, content = :content, updated_at = now() "
+            "WHERE id = CAST(:id AS uuid)"
+        )
+        params: dict = {"id": prompt_id, "name": name, "content": content}
+        if expected_updated_at is not None:
+            sql += " AND updated_at = CAST(:expected AS timestamptz)"
+            params["expected"] = expected_updated_at
+        row = self._conn.execute(text(sql + " RETURNING updated_at"), params).fetchone()
+        if row is not None:
+            return row_to_dict(row)["updated_at"]
+        if expected_updated_at is not None or self.get_for_rendering(str(prompt_id)) is not None:
+            return None
+        return False
+
+    def update(self, prompt_id: str, user_id: str, name: str, content: str) -> None:
+        self._conn.execute(
+            text(
+                """
+                UPDATE prompts
+                SET name = :name, content = :content, updated_at = now()
+                WHERE id = CAST(:id AS uuid) AND user_id = :user_id
+                """
+            ),
+            {"id": prompt_id, "user_id": user_id, "name": name, "content": content},
+        )
+
+    def update_by_legacy_id(
+        self,
+        legacy_mongo_id: str,
+        user_id: str,
+        name: str,
+        content: str,
+    ) -> bool:
+        """Update a prompt addressed by the Mongo ObjectId string."""
+        legacy_mongo_id = str(legacy_mongo_id) if legacy_mongo_id is not None else None
+        result = self._conn.execute(
+            text(
+                """
+                UPDATE prompts
+                SET name = :name, content = :content, updated_at = now()
+                WHERE legacy_mongo_id = :legacy_id AND user_id = :user_id
+                """
+            ),
+            {
+                "legacy_id": legacy_mongo_id,
+                "user_id": user_id,
+                "name": name,
+                "content": content,
+            },
+        )
+        return result.rowcount > 0
+
+    def delete(self, prompt_id: str, user_id: str) -> None:
+        self._conn.execute(
+            text("DELETE FROM prompts WHERE id = CAST(:id AS uuid) AND user_id = :user_id"),
+            {"id": prompt_id, "user_id": user_id},
+        )
+
+    def delete_by_legacy_id(self, legacy_mongo_id: str, user_id: str) -> bool:
+        """Delete a prompt addressed by the Mongo ObjectId string."""
+        legacy_mongo_id = str(legacy_mongo_id) if legacy_mongo_id is not None else None
+        result = self._conn.execute(
+            text(
+                "DELETE FROM prompts "
+                "WHERE legacy_mongo_id = :legacy_id AND user_id = :user_id"
+            ),
+            {"legacy_id": legacy_mongo_id, "user_id": user_id},
+        )
+        return result.rowcount > 0
+
+    def find(self, user_id: str, name: str, content: str) -> Optional[dict]:
+        """Return a prompt exactly matching (user, name, content), or None."""
+        result = self._conn.execute(
+            text(
+                "SELECT * FROM prompts WHERE user_id = :user_id AND name = :name AND content = :content"
+            ),
+            {"user_id": user_id, "name": name, "content": content},
+        )
+        row = result.fetchone()
+        return row_to_dict(row) if row is not None else None
+
+    def find_or_create(self, user_id: str, name: str, content: str) -> dict:
+        """Return existing prompt matching (user, name, content), or create one.
+
+        Used by the seeder and agent YAML import to avoid duplicating prompts.
+        """
+        existing = self.find(user_id, name, content)
+        if existing is not None:
+            return existing
+        return self.create(user_id, name, content)

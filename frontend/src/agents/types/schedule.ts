@@ -1,0 +1,133 @@
+import type { SchedulePayerFields } from '../../payer/types';
+
+export type ScheduleTriggerType = 'once' | 'recurring';
+
+export type ScheduleStatus = 'active' | 'paused' | 'completed' | 'cancelled';
+
+export type ScheduleRunStatus =
+  'pending' | 'running' | 'success' | 'failed' | 'skipped' | 'timeout';
+
+// Mirrors the schedule_runs.error_type CHECK constraint (migrations 0010, 0027,
+// 0063, 0065). The last four name a run skipped while the schedule is paused
+// for its payer; `payer_out_of_allowance` also names a run stopped mid-way at
+// the payer's allowance (failed, partial output kept).
+export type ScheduleRunErrorType =
+  | 'auth_expired'
+  | 'tool_not_allowed'
+  | 'budget_exceeded'
+  | 'timeout'
+  | 'agent_error'
+  | 'internal'
+  | 'missed'
+  | 'overlap'
+  | 'stream_error'
+  | 'empty_output'
+  | 'cannot_complete'
+  | 'owner_inactive'
+  | 'payer_left'
+  | 'no_payer'
+  | 'payer_out_of_allowance';
+
+/**
+ * A schedule as every read returns it. `paid_by` is who pays for its runs,
+ * `paused_for` why it is paused for that payer (only while active), and
+ * `can_take_over` whether the caller may become the payer.
+ */
+export type Schedule = SchedulePayerFields & {
+  id: string;
+  user_id: string;
+  // Null for agentless one-time tasks (migration 0011).
+  agent_id: string | null;
+  trigger_type: ScheduleTriggerType;
+  name?: string | null;
+  instruction: string;
+  status: ScheduleStatus;
+  cron?: string | null;
+  run_at?: string | null;
+  timezone: string;
+  next_run_at?: string | null;
+  last_run_at?: string | null;
+  end_at?: string | null;
+  tool_allowlist: string[];
+  model_id?: string | null;
+  token_budget?: number | null;
+  origin_conversation_id?: string | null;
+  created_via: 'chat' | 'ui' | 'api';
+  consecutive_failure_count: number;
+  // Its runs are skipped while the agent's owner or its user is deactivated.
+  owner_inactive?: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ScheduleRun = {
+  id: string;
+  schedule_id: string;
+  user_id: string;
+  // Null for runs of agentless schedules (migration 0011).
+  agent_id: string | null;
+  status: ScheduleRunStatus;
+  scheduled_for: string;
+  trigger_source: 'cron' | 'manual';
+  started_at?: string | null;
+  finished_at?: string | null;
+  output?: string | null;
+  output_truncated: boolean;
+  error?: string | null;
+  error_type?: ScheduleRunErrorType | null;
+  prompt_tokens: number;
+  generated_tokens: number;
+  conversation_id?: string | null;
+  message_id?: string | null;
+  celery_task_id?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ScheduleListResponse = { schedules: Schedule[] };
+
+/** A schedule from the cross-agent list, with the names it is grouped by. */
+export type UserSchedule = Schedule & {
+  agent_name?: string | null;
+  agent_image?: string | null;
+  origin_conversation_name?: string | null;
+  /** A teammate's agent's schedule, managed through a team. */
+  team?: boolean;
+};
+
+export type UserScheduleListResponse = { schedules: UserSchedule[] };
+
+/** Run totals for an agent's schedules over the last `days` days. */
+export type ScheduleStats = {
+  days: number;
+  runs: number;
+  failed: number;
+  tokens: number;
+  latest_failure: {
+    scheduled_for: string;
+    status: ScheduleRunStatus;
+    error_type?: ScheduleRunErrorType | null;
+  } | null;
+};
+export type ScheduleResponse = { schedule: Schedule };
+export type ScheduleRunListResponse = {
+  runs: ScheduleRun[];
+  limit: number;
+  offset: number;
+};
+export type ScheduleRunResponse = { run: ScheduleRun };
+
+export type ScheduleCreatePayload = {
+  instruction: string;
+  trigger_type?: ScheduleTriggerType;
+  cron?: string;
+  run_at?: string; // ISO 8601 UTC; set for trigger_type === 'once'
+  timezone?: string;
+  name?: string;
+  end_at?: string;
+  tool_allowlist?: string[];
+  model_id?: string;
+  token_budget?: number;
+};
+
+export type ScheduleUpdatePayload = Partial<ScheduleCreatePayload>;

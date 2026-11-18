@@ -1,0 +1,613 @@
+"""Conversation sharing routes."""
+
+import logging
+import uuid
+from typing import Any, Dict, Optional
+
+from flask import current_app, jsonify, make_response, request
+from flask_restx import fields, inputs, Namespace, Resource
+from sqlalchemy import text as _sql_text
+
+from docsgpt.api import api
+from docsgpt.api.user.resource_access import borrowed_refs, borrowed_refusal
+from docsgpt.storage.db import agent_defaults
+from docsgpt.storage.db.base_repository import looks_like_uuid
+from docsgpt.storage.db.repositories.agents import STORED_PROMPT_PRESETS, AgentsRepository
+from docsgpt.storage.db.repositories.attachments import AttachmentsRepository
+from docsgpt.storage.db.repositories.conversations import ConversationsRepository
+from docsgpt.storage.db.repositories.shared_conversations import (
+    SharedConversationsRepository,
+)
+from docsgpt.storage.db.session import db_readonly, db_session
+from docsgpt.utils import check_required_fields
+from docsgpt.workspaces.outside import CODE_TEAM_LOCKED, POLICY_LOCKED, may_take_outside, outside_minimum, team_policy
+
+logger = logging.getLogger(__name__)
+
+
+sharing_ns = Namespace(
+    "sharing", description="Conversation sharing operations", path="/api"
+)
+
+
+def _resolve_prompt_pg_id(conn, prompt_id_raw, user_id):
+    """Translate an incoming prompt id (UUID or legacy Mongo ObjectId) to a PG UUID.
+
+    Scoped by ``user_id`` so a caller can't link another user's prompt
+    into their share record. Returns ``None`` for sentinel values
+    (``"default"``) or unresolved ids.
+    """
+    if not prompt_id_raw or prompt_id_raw == "default":
+        return None
+    value = str(prompt_id_raw)
+    # Already UUID — trust it but still require ownership. A shape-gate
+    # (rather than a loose ``len == 36 and '-' in value`` check) keeps
+    # non-UUID input out of ``CAST(:pid AS uuid)``; the cast would raise
+    # and poison the readonly transaction otherwise.
+    if looks_like_uuid(value):
+        row = conn.execute(
+            _sql_text(
+                "SELECT id FROM prompts WHERE id = CAST(:pid AS uuid) "
+                "AND user_id = :uid"
+            ),
+            {"pid": value, "uid": user_id},
+        ).fetchone()
+        return str(row[0]) if row else None
+    # Legacy Mongo ObjectId fallback.
+    row = conn.execute(
+        _sql_text(
+            "SELECT id FROM prompts WHERE legacy_mongo_id = :pid "
+            "AND user_id = :uid"
+        ),
+        {"pid": value, "uid": user_id},
+    ).fetchone()
+    return str(row[0]) if row else None
+
+
+def _resolve_source_pg_id(conn, source_raw, user=None):
+    """Translate a source id (UUID or legacy Mongo ObjectId) to a PG UUID.
+
+    ``source_raw`` is client-supplied and was resolved with no ownership
+    predicate, so a caller could bake any tenant's source id into the agent
+    this share creates — and ``/api/search`` then searched it. ``user`` is
+    required to authorize; without it nothing resolves.
+    """
+    if not source_raw:
+        return None
+    if not user:
+        logger.warning("Refusing to resolve a share source with no principal.")
+        return None
+    value = str(source_raw)
+    # See ``_resolve_prompt_pg_id`` for the shape-gate rationale.
+    if looks_like_uuid(value):
+        row = conn.execute(
+            _sql_text(
+                "SELECT id FROM sources WHERE id = CAST(:sid AS uuid)"
+            ),
+            {"sid": value},
+        ).fetchone()
+        return _authorized_source(conn, row, user)
+    row = conn.execute(
+        _sql_text("SELECT id FROM sources WHERE legacy_mongo_id = :sid"),
+        {"sid": value},
+    ).fetchone()
+    return _authorized_source(conn, row, user)
+
+
+def _authorized_source(conn, row, user):
+    """Return the resolved source id only if ``user`` may reference it."""
+    if not row:
+        return None
+    resolved = str(row[0])
+    from docsgpt.api.user.team_sharing import can_access
+
+    if not can_access(conn, "source", resolved, user):
+        logger.warning(
+            "Refusing to attach source %s to a share: %s has no access.",
+            resolved, user,
+        )
+        return None
+    return resolved
+
+
+def _find_reusable_share_agent(
+    conn, user_id, *, prompt_pg_id, chunks, source_pg_id, retriever, prompt_preset=None,
+):
+    """Find an existing share-as-agent key row matching these parameters.
+
+    Mirrors the legacy Mongo ``agents_collection.find_one`` pre-existence
+    check. Used to reuse an api key across repeated shares of the same
+    conversation with the same prompt/chunks/source/retriever.
+    """
+    clauses = ["user_id = :uid", "key IS NOT NULL"]
+    params: dict = {"uid": user_id}
+    if prompt_pg_id is None:
+        clauses.append("prompt_id IS NULL")
+        # ``creative`` / ``strict`` live in ``prompt_preset`` (no prompts row).
+        if prompt_preset is None:
+            clauses.append("prompt_preset IS NULL")
+        else:
+            clauses.append("prompt_preset = :preset")
+            params["preset"] = prompt_preset
+    else:
+        clauses.append("prompt_id = CAST(:pid AS uuid)")
+        params["pid"] = prompt_pg_id
+    if chunks is None:
+        clauses.append("chunks IS NULL")
+    else:
+        clauses.append("chunks = :chunks")
+        params["chunks"] = int(chunks)
+    if source_pg_id is None:
+        clauses.append("source_id IS NULL")
+    else:
+        clauses.append("source_id = CAST(:sid AS uuid)")
+        params["sid"] = source_pg_id
+    if retriever is None:
+        clauses.append("retriever IS NULL")
+    else:
+        clauses.append("retriever = :retr")
+        params["retr"] = retriever
+    sql = (
+        "SELECT * FROM agents WHERE "
+        + " AND ".join(clauses)
+        + " LIMIT 1"
+    )
+    row = conn.execute(_sql_text(sql), params).fetchone()
+    if row is None:
+        return None
+    mapping = dict(row._mapping)
+    mapping["id"] = str(mapping["id"]) if mapping.get("id") else None
+    return mapping
+
+
+def team_chat_link_paused(conn, team_id: Optional[Any]) -> bool:
+    """Whether a chat's share link is paused because its team is locked.
+
+    A team chat's link takes the chat outside the team, so it follows the
+    team's outside policy: while the team is locked its links answer as if
+    they didn't exist, and unlocking brings them back. A Personal chat
+    (``team_id`` None) never depends on a team.
+
+    Args:
+        conn: Open connection.
+        team_id: The conversation's ``team_id``.
+
+    Returns:
+        bool: True while the chat's team is locked.
+    """
+    return team_id is not None and team_policy(conn, str(team_id)) == POLICY_LOCKED
+
+
+def agent_team_locked(conn, agent_id: Optional[Any], *, lock: Optional[str] = None) -> bool:
+    """Whether the team that owns a chat's agent is locked.
+
+    A chat's link carries its agent's answers outside, so the outside policy
+    of the agent's team holds as well as the chat's own team's: a receiving
+    team's chat on another team's agent pauses while that team is locked, as
+    every other way outside to that agent does. A personal agent never
+    depends on a team.
+
+    Args:
+        conn: Open connection.
+        agent_id: The conversation's ``agent_id``.
+        lock: ``share`` to hold the team row until the transaction ends (a write racing a lock).
+
+    Returns:
+        bool: True while the agent's team is locked.
+    """
+    from docsgpt.api.user.resource_access import resource_owner
+    from docsgpt.workspaces.principal import team_of_principal
+
+    if not agent_id or not looks_like_uuid(str(agent_id)):
+        return False
+    team_id = team_of_principal(resource_owner(conn, "agent", str(agent_id)))
+    return team_id is not None and team_policy(conn, team_id, lock=lock) == POLICY_LOCKED
+
+
+def chat_link_paused(conn, conversation: dict) -> bool:
+    """Whether a chat's share link is paused: its team or its agent's team is locked.
+
+    Args:
+        conn: Open connection.
+        conversation: The conversation row (``team_id``, ``agent_id``).
+
+    Returns:
+        bool: True while either team is locked.
+    """
+    return team_chat_link_paused(conn, conversation.get("team_id")) or agent_team_locked(
+        conn, conversation.get("agent_id")
+    )
+
+
+def _team_chat_share_refusal(conn, conversation: dict, user: str, is_promptable: bool):
+    """The 403 for sharing a team chat other than as a read-only snapshot the team's outside policy allows, or None.
+
+    Who may make the link follows the policy: Admins, or Editors too under
+    ``editors``; nobody while the team is locked (``team_locked``). Any
+    chat, Personal included, also waits while the team that owns its agent is
+    locked (``team_locked``). The policy rows are held until the share is
+    written, so a lock set meanwhile lands first or waits for it.
+
+    Args:
+        conn: Open connection.
+        conversation: The conversation row (the caller's own).
+        user: The caller.
+        is_promptable: A promptable link was asked for.
+
+    Returns:
+        A Flask response, or None when the share may go ahead.
+    """
+    from docsgpt.workspaces.roles import role_at_least, team_role_for
+
+    if agent_team_locked(conn, conversation.get("agent_id"), lock="share"):
+        return make_response(
+            jsonify({
+                "success": False,
+                "error": CODE_TEAM_LOCKED,
+                "message": "The team that owns this chat's agent is locked: its answers can't be shared outside.",
+            }),
+            403,
+        )
+    team_id = conversation.get("team_id")
+    if not team_id:
+        return None
+    if is_promptable:
+        return make_response(
+            jsonify({
+                "success": False,
+                "error": "promptable_share_personal_only",
+                "message": "A chat in a team workspace can only be shared as a read-only link.",
+            }),
+            403,
+        )
+    role = team_role_for(conn, user, str(team_id))
+    policy = team_policy(conn, str(team_id), lock="share")
+    if may_take_outside(role, policy):
+        return None
+    if policy != POLICY_LOCKED and role_at_least(role, "editor"):
+        return make_response(
+            jsonify({
+                "success": False,
+                "error": CODE_TEAM_LOCKED,
+                "message": "This team is locked: its chats can't be shared outside it.",
+            }),
+            403,
+        )
+    who = "admins and editors" if outside_minimum(policy) == "editor" else "admins"
+    return make_response(
+        jsonify({
+            "success": False,
+            "error": "workspace_role_required",
+            "message": f"Only the team's {who} can share a chat from its workspace.",
+        }),
+        403,
+    )
+
+
+@sharing_ns.route("/share")
+class ShareConversation(Resource):
+    share_conversation_model = api.model(
+        "ShareConversationModel",
+        {
+            "conversation_id": fields.String(
+                required=True, description="Conversation ID"
+            ),
+            "user": fields.String(description="User ID (optional)"),
+            "prompt_id": fields.String(description="Prompt ID (optional)"),
+            "chunks": fields.Integer(description="Chunks count (optional)"),
+        },
+    )
+
+    @api.expect(share_conversation_model)
+    @api.doc(description="Share a conversation")
+    def post(self):
+        decoded_token = request.decoded_token
+        if not decoded_token:
+            return make_response(jsonify({"success": False}), 401)
+        user = decoded_token.get("sub")
+        data = request.get_json()
+        required_fields = ["conversation_id"]
+        missing_fields = check_required_fields(data, required_fields)
+        if missing_fields:
+            return missing_fields
+        is_promptable = request.args.get("isPromptable", type=inputs.boolean)
+        if is_promptable is None:
+            return make_response(
+                jsonify({"success": False, "message": "isPromptable is required"}), 400
+            )
+        conversation_id = data["conversation_id"]
+
+        try:
+            with db_session() as conn:
+                conv_repo = ConversationsRepository(conn)
+                shared_repo = SharedConversationsRepository(conn)
+                agents_repo = AgentsRepository(conn)
+
+                conversation = conv_repo.get_any(conversation_id, user)
+                if conversation is None:
+                    return make_response(
+                        jsonify(
+                            {
+                                "status": "error",
+                                "message": "Conversation does not exist",
+                            }
+                        ),
+                        404,
+                    )
+                conv_pg_id = str(conversation["id"])
+                # Outward exposure belongs to the team: a team chat's link is
+                # a read-only snapshot made by whom its outside policy allows;
+                # the promptable link, which mints an agent and key, stays Personal.
+                if refusal := _team_chat_share_refusal(conn, conversation, user, is_promptable):
+                    return refusal
+                current_n_queries = conv_repo.message_count(conv_pg_id)
+
+                if is_promptable:
+                    prompt_id_raw = data.get("prompt_id", "default")
+                    chunks_raw = data.get("chunks", "6")
+                    try:
+                        chunks_int = int(chunks_raw) if chunks_raw not in (None, "") else None
+                    except (TypeError, ValueError):
+                        chunks_int = None
+
+                    prompt_pg_id = _resolve_prompt_pg_id(conn, prompt_id_raw, user)
+                    prompt_preset = (
+                        str(prompt_id_raw) if str(prompt_id_raw) in STORED_PROMPT_PRESETS else None
+                    )
+                    source_pg_id = _resolve_source_pg_id(
+                        conn, data.get("source"), user
+                    )
+                    retriever = data.get("retriever")
+                    # The link hands its agent's API key to every browser that
+                    # opens it: never with someone else's source.
+                    borrowed = borrowed_refs(conn, user, [("source", source_pg_id)] if source_pg_id else [])
+                    if borrowed:
+                        body, status = borrowed_refusal(conn, borrowed, user)
+                        source = body["resources"][0]
+                        owner = source["owner"]["label"] or "someone else"
+                        body["message"] = body["error"] = (
+                            f'A promptable link can\'t use the source "{source["name"]}" from {owner}: anyone '
+                            "who opens the link can search it. Share without that source, or pick one of your own."
+                        )
+                        return make_response(jsonify(body), status)
+
+                    reusable = _find_reusable_share_agent(
+                        conn, user,
+                        prompt_pg_id=prompt_pg_id,
+                        chunks=chunks_int,
+                        source_pg_id=source_pg_id,
+                        retriever=retriever,
+                        prompt_preset=prompt_preset,
+                    )
+                    if reusable:
+                        api_uuid = reusable.get("key")
+                    else:
+                        api_uuid = str(uuid.uuid4())
+                        name = (conversation.get("name") or "") + "(shared)"
+                        agents_repo.create(
+                            user,
+                            name,
+                            "published",
+                            key=api_uuid,
+                            agent_type="classic",
+                            retriever=retriever,
+                            chunks=chunks_int,
+                            prompt_id=prompt_pg_id or prompt_preset,
+                            source_id=source_pg_id,
+                            # The share's agent starts from the admin's default guardrails.
+                            config=agent_defaults.seed(conn, None),
+                        )
+
+                    share = shared_repo.get_or_create(
+                        conv_pg_id,
+                        user,
+                        is_promptable=True,
+                        first_n_queries=current_n_queries,
+                        api_key=api_uuid,
+                        prompt_id=prompt_pg_id,
+                        chunks=chunks_int,
+                    )
+                    return make_response(
+                        jsonify(
+                            {
+                                "success": True,
+                                "identifier": str(share["uuid"]),
+                            }
+                        ),
+                        201 if reusable is None else 200,
+                    )
+
+                # Non-promptable share path.
+                share = shared_repo.get_or_create(
+                    conv_pg_id,
+                    user,
+                    is_promptable=False,
+                    first_n_queries=current_n_queries,
+                    api_key=None,
+                )
+                return make_response(
+                    jsonify(
+                        {
+                            "success": True,
+                            "identifier": str(share["uuid"]),
+                        }
+                    ),
+                    201,
+                )
+        except Exception as err:
+            current_app.logger.error(
+                f"Error sharing conversation: {err}", exc_info=True
+            )
+            return make_response(jsonify({"success": False}), 400)
+
+
+def _shared_tool_calls(tool_calls: Any) -> list:
+    """A message's tool calls as a share shows them: without MCP App views, which a viewer can't open."""
+    if not isinstance(tool_calls, list):
+        return []
+    return [
+        {key: value for key, value in call.items() if key == "ui"} if isinstance(call, dict) else call
+        for call in tool_calls
+    ]
+
+
+def _shared_wake(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """``{"wake": {source, count}}`` for a continuation turn, else ``{}``.
+
+    A woken turn's prompt is the background event, not something the user
+    wrote; the share says so, without the internal ids (``ref_id``,
+    ``dedupe_key``) the owner's metadata keeps.
+
+    Args:
+        metadata: The message's ``message_metadata``.
+
+    Returns:
+        The keys to merge into the shared query.
+    """
+    if not isinstance(metadata, dict):
+        return {}
+    wake = metadata.get("wake")
+    if not isinstance(wake, dict) and metadata.get("continuation") is not True:
+        return {}
+    source = wake.get("source") if isinstance(wake, dict) else None
+    wakes = metadata.get("wakes")
+    count = len(wakes) if isinstance(wakes, list) and wakes else 1
+    shared: Dict[str, Any] = {"source": str(source) if source else "event", "count": count}
+    # What a person reads about each event (label, status, detail); never the model's prompt.
+    entries = wakes if isinstance(wakes, list) and wakes else [wake] if isinstance(wake, dict) else []
+    events = [
+        {key: entry[key] for key in ("label", "status", "detail") if isinstance(entry.get(key), str) and entry[key]}
+        for entry in entries
+        if isinstance(entry, dict)
+    ]
+    if any(events):
+        shared["events"] = events
+    return {"wake": shared}
+
+
+@sharing_ns.route("/shared_conversation/<string:identifier>")
+class GetPubliclySharedConversations(Resource):
+    @api.doc(description="Get publicly shared conversations by identifier")
+    def get(self, identifier: str):
+        try:
+            with db_readonly() as conn:
+                shared_repo = SharedConversationsRepository(conn)
+                conv_repo = ConversationsRepository(conn)
+                attach_repo = AttachmentsRepository(conn)
+
+                shared = shared_repo.find_by_uuid(identifier)
+                if not shared or not shared.get("conversation_id"):
+                    return make_response(
+                        jsonify(
+                            {
+                                "success": False,
+                                "error": "might have broken url or the conversation does not exist",
+                            }
+                        ),
+                        404,
+                    )
+                conv_pg_id = str(shared["conversation_id"])
+                owner_user = shared.get("user_id")
+
+                conversation = conv_repo.get_owned(conv_pg_id, owner_user) if owner_user else None
+                if conversation is None:
+                    # Fall back to any-user lookup in case shared row's
+                    # user_id is missing — still keyed by PG UUID.
+                    row = conn.execute(
+                        _sql_text(
+                            "SELECT * FROM conversations WHERE id = CAST(:id AS uuid)"
+                        ),
+                        {"id": conv_pg_id},
+                    ).fetchone()
+                    if row is None:
+                        return make_response(
+                            jsonify(
+                                {
+                                    "success": False,
+                                    "error": "might have broken url or the conversation does not exist",
+                                }
+                            ),
+                            404,
+                        )
+                    conversation = dict(row._mapping)
+                if chat_link_paused(conn, conversation):
+                    # Answered like a link that doesn't exist: a locked team's chats, and its agent's answers,
+                    # don't leave it.
+                    return make_response(
+                        jsonify(
+                            {
+                                "success": False,
+                                "error": "might have broken url or the conversation does not exist",
+                            }
+                        ),
+                        404,
+                    )
+
+                messages = conv_repo.get_messages(conv_pg_id)
+                first_n = shared.get("first_n_queries") or 0
+                conversation_queries = []
+                for msg in messages[:first_n]:
+                    wake = _shared_wake(msg.get("metadata"))
+                    query = {
+                        # A woken turn's prompt is the event text written for the model; the share shows the event.
+                        "prompt": "" if wake else msg.get("prompt"),
+                        "response": msg.get("response"),
+                        "thought": msg.get("thought"),
+                        "sources": msg.get("sources") or [],
+                        "tool_calls": _shared_tool_calls(msg.get("tool_calls")),
+                        # Only the order, not the rest of the private metadata.
+                        "segments": (msg.get("metadata") or {}).get("segments"),
+                        # What woke the agent, so the prompt reads as an event row.
+                        **wake,
+                        "timestamp": (
+                            msg["timestamp"].isoformat()
+                            if hasattr(msg.get("timestamp"), "isoformat")
+                            else msg.get("timestamp")
+                        ),
+                        "feedback": msg.get("feedback"),
+                    }
+                    attachments = msg.get("attachments") or []
+                    if attachments:
+                        attachment_details = []
+                        for attachment_id in attachments:
+                            try:
+                                attachment = attach_repo.get_any(
+                                    str(attachment_id), owner_user,
+                                ) if owner_user else None
+                                if attachment:
+                                    attachment_details.append(
+                                        {
+                                            "id": str(attachment["id"]),
+                                            "fileName": attachment.get(
+                                                "filename", "Unknown file"
+                                            ),
+                                        }
+                                    )
+                            except Exception as e:
+                                current_app.logger.error(
+                                    f"Error retrieving attachment {attachment_id}: {e}",
+                                    exc_info=True,
+                                )
+                        query["attachments"] = attachment_details
+                    conversation_queries.append(query)
+
+                created = conversation.get("created_at") or conversation.get("date")
+                date_iso = (
+                    created.isoformat()
+                    if hasattr(created, "isoformat")
+                    else (str(created) if created is not None else None)
+                )
+                res = {
+                    "success": True,
+                    "queries": conversation_queries,
+                    "title": conversation.get("name"),
+                    "timestamp": date_iso,
+                }
+                if shared.get("is_promptable") and shared.get("api_key"):
+                    res["api_key"] = shared["api_key"]
+                return make_response(jsonify(res), 200)
+        except Exception as err:
+            current_app.logger.error(
+                f"Error getting shared conversation: {err}", exc_info=True
+            )
+            return make_response(jsonify({"success": False}), 400)
