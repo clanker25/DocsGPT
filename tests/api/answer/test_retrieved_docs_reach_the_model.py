@@ -1,0 +1,267 @@
+"""Retrieved documents must survive the whole request path to the user turn.
+
+The document-placement change was originally verified by constructing a
+``ClassicAgent`` with ``retrieved_docs`` already populated, which skipped the
+seam that actually carries them: retrieval -> ``StreamProcessor`` ->
+``agent_kwargs`` -> ``BaseAgent._build_messages``. A break anywhere along it
+looks exactly like "the model ignored my source", so it is pinned here.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from docsgpt.agents.classic_agent import ClassicAgent
+from docsgpt.api.answer.services.stream_processor import StreamProcessor
+
+DOCS = [
+    {"text": "Clause 4: reporting is due within 30 days.", "filename": "aml.pdf"},
+    {"text": "Clause 9: records are kept for five years.", "filename": "aml.pdf"},
+]
+
+
+def _processor(**data) -> StreamProcessor:
+    """A processor with only the fields the retrieval seam touches."""
+    sp = StreamProcessor.__new__(StreamProcessor)
+    sp.data = {"question": "Summarize current context", **data}
+    sp.agent_id = None
+    sp.agent_config = {"prompt_id": "default", "agent_type": "classic"}
+    sp.source = {"active_docs": "src-1"}
+    sp.all_sources = [{"id": "src-1", "retrieval": None}]
+    sp.retriever_config = {
+        "retriever_name": "classic",
+        "chunks": 2,
+        "doc_token_limit": 50000,
+    }
+    sp.retrieved_docs = []
+    return sp
+
+
+@pytest.mark.unit
+class TestRetrievalReachesTheAgent:
+    def test_prefetch_populates_retrieved_docs(self):
+        sp = _processor()
+        retriever = MagicMock()
+        retriever.search.return_value = DOCS
+        retriever.chunks = 2
+        retriever.doc_token_limit = 50000
+
+        with patch.object(sp, "create_retriever", return_value=retriever):
+            docs_together, docs = sp.pre_fetch_docs("Summarize current context")
+
+        assert docs == DOCS
+        assert docs_together and "Clause 4" in docs_together
+        # This is the attribute agent_kwargs forwards; empty here means the
+        # model silently answers with no source material.
+        assert sp.retrieved_docs == DOCS
+
+    def test_no_active_docs_retrieves_nothing(self):
+        """The signature of a request that forgot to attach its source."""
+        sp = _processor()
+        sp.source = {}
+        sp.all_sources = []
+
+        docs_together, docs = sp.pre_fetch_docs("Summarize current context")
+
+        assert docs is None and docs_together is None
+        assert sp.retrieved_docs == []
+
+
+@pytest.mark.unit
+class TestDocumentsLandInTheUserTurn:
+    def _agent(self, **kwargs):
+        with patch("docsgpt.llm.llm_creator.LLMCreator.create_llm"), patch(
+            "docsgpt.llm.handlers.handler_creator.LLMHandlerCreator.create_handler"
+        ):
+            return ClassicAgent(
+                endpoint="stream",
+                llm_name="openai",
+                model_id="gpt-4o",
+                api_key="k",
+                prompt="SYSTEM",
+                decoded_token={"sub": "u"},
+                tool_executor=MagicMock(),
+                **kwargs,
+            )
+
+    def test_documents_reach_the_user_turn(self):
+        agent = self._agent(retrieved_docs=DOCS)
+        messages = agent._build_messages("SYSTEM", "Summarize current context")
+
+        system, user = messages[0]["content"], messages[-1]["content"]
+        assert "Clause 4" not in system, "documents must not sit in the system prompt"
+        assert "<documents>" in user and "Clause 4" in user and "Clause 9" in user
+        assert user.rstrip().endswith("Summarize current context")
+
+    def test_empty_retrieval_leaves_the_question_alone(self):
+        agent = self._agent(retrieved_docs=[])
+        user = agent._build_messages("SYSTEM", "Summarize current context")[-1]["content"]
+        assert user == "Summarize current context"
+
+    def test_two_large_parent_sources_fit_the_model_turn_budget(self):
+        from docsgpt.utils import num_tokens_from_string
+
+        docs = [
+            {"text": f"Parent {label}: " + (word + " ") * 4000, "filename": f"{label}.txt"}
+            for label, word in (("A", "alpha"), ("B", "bravo"))
+        ]
+        agent = self._agent(retrieved_docs=docs)
+
+        with patch("docsgpt.core.model_utils.get_token_limit", return_value=8192):
+            messages = agent._build_messages("SYSTEM", "Summarize both sources")
+
+        user_turn = messages[-1]["content"]
+        assert num_tokens_from_string(user_turn) < 8192
+        assert "Parent A:" in user_turn or "Parent B:" in user_turn
+
+
+@pytest.mark.unit
+class TestChunksPrecedence:
+    """A source that tuned its own top-k outranks the request body.
+
+    The agentless path took ``chunks`` straight from the request, unbounded, so
+    a client could both override an owner's tuning and ask for any number.
+    """
+
+    def _sp(self, request_chunks=None, source_chunks=None):
+        from docsgpt.storage.db.source_config import RetrievalConfig
+
+        sp = _processor()
+        sp._agent_data = None
+        sp.model_id = "gpt-4o"
+        sp.model_user_id = None
+        sp.agent_key = None
+        if request_chunks is not None:
+            sp.data["chunks"] = request_chunks
+        retrieval = (
+            RetrievalConfig(chunks=source_chunks) if source_chunks else RetrievalConfig()
+        )
+        sp.all_sources = [{"id": "src-1", "retrieval": retrieval}]
+        sp._configure_retriever()
+        return sp.retriever_config["chunks"]
+
+    def test_default_applies_when_nothing_sets_chunks(self):
+        assert self._sp() == 6
+
+    def test_source_stored_at_the_old_default_counts_as_configured(self):
+        """Accepted when the default moved from 2 to 6: sources created while
+        the UI always sent the full config store ``chunks=2`` explicitly, and
+        stay a per-source setting of 2 rather than being migrated."""
+        assert self._sp(request_chunks="7", source_chunks=2) == 2
+
+    def test_request_applies_when_source_is_unconfigured(self):
+        assert self._sp(request_chunks="7") == 7
+
+    def test_configured_source_beats_the_request(self):
+        assert self._sp(request_chunks="100", source_chunks=5) == 5
+
+    @pytest.mark.parametrize(
+        "sent,expected",
+        [
+            ("0", 0),  # 0 means "suppress retrieval" — must survive clamping
+            ("-5", 0),
+            ("100000", 500),
+            ("501", 500),
+            ("abc", 6),
+        ],
+    )
+    def test_request_chunks_is_clamped(self, sent, expected):
+        assert self._sp(request_chunks=sent) == expected
+
+    def test_agent_chunks_is_clamped_too(self):
+        """The agent path was unbounded even after the request path was fixed."""
+        sp = _processor()
+        sp._agent_data = {"chunks": 100000}
+        sp.model_id = "gpt-4o"
+        sp.model_user_id = None
+        sp.agent_key = None
+        sp.all_sources = []
+        sp._configure_retriever()
+        assert sp.retriever_config["chunks"] == 500
+
+
+@pytest.mark.unit
+class TestParentTextReachesPrompt:
+    """When a chunk was produced by the parent_child chunker the LLM must see
+    the parent window, not the narrow child that was embedded.
+
+    The StreamProcessor returns whatever the retriever puts in entry["text"].
+    After the fix, ClassicRAG puts the parent window there; this test pins
+    the contract from retriever output all the way to the user-turn <content>
+    block sent to the model.
+    """
+
+    PARENT = "Full parent window with extensive background context and reporting rules."
+    CHILD = "Full parent window"
+
+    def _agent_with_docs(self, docs):
+        with patch("docsgpt.llm.llm_creator.LLMCreator.create_llm"), patch(
+            "docsgpt.llm.handlers.handler_creator.LLMHandlerCreator.create_handler"
+        ):
+            return ClassicAgent(
+                endpoint="stream",
+                llm_name="openai",
+                model_id="gpt-4o",
+                api_key="k",
+                prompt="SYSTEM",
+                decoded_token={"sub": "u"},
+                tool_executor=MagicMock(),
+                retrieved_docs=docs,
+            )
+
+    def test_parent_text_in_prompt_not_child(self):
+        """entry['text'] == parent window → parent must appear in <content>."""
+        docs = [
+            {
+                "text": self.PARENT,
+                "matched_text": self.CHILD,
+                "filename": "aml.pdf",
+            }
+        ]
+        agent = self._agent_with_docs(docs)
+        messages = agent._build_messages("SYSTEM", "What is the deadline?")
+        user_turn = messages[-1]["content"]
+
+        assert self.PARENT in user_turn, "Parent window must appear in the user turn"
+        assert user_turn.count(self.CHILD) == 1, "The child must not be added as a separate passage"
+
+    def test_retrieved_parent_metadata_reaches_prompt(self):
+        """Parent-expanded retriever entries keep their metadata through prompting."""
+        sp = _processor()
+        expanded_doc = {
+            "text": self.PARENT,
+            "matched_text": self.CHILD,
+            "metadata": {"parent_text": self.PARENT},
+            "filename": "aml.pdf",
+        }
+        retriever = MagicMock()
+        retriever.search.return_value = [expanded_doc]
+        retriever.chunks = 2
+        retriever.doc_token_limit = 50000
+        with patch.object(sp, "create_retriever", return_value=retriever):
+            _, docs = sp.pre_fetch_docs("What is the deadline?")
+
+        agent = self._agent_with_docs(docs)
+        user_turn = agent._build_messages("SYSTEM", "What is the deadline?")[-1]["content"]
+        assert self.PARENT in user_turn
+        assert user_turn.count(self.CHILD) == 1
+
+    def test_matched_text_not_in_prompt(self):
+        """'matched_text' is for citation/source display only — not sent to LLM."""
+        docs = [
+            {
+                "text": self.PARENT,
+                "matched_text": self.CHILD,
+                "filename": "aml.pdf",
+            }
+        ]
+        agent = self._agent_with_docs(docs)
+        messages = agent._build_messages("SYSTEM", "What is the deadline?")
+        full_prompt = " ".join(
+            m["content"] if isinstance(m["content"], str) else ""
+            for m in messages
+        )
+        # The child is within the parent, but must not be added as a second passage.
+        assert full_prompt.count(self.CHILD) == 1

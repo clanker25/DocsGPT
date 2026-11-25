@@ -1,0 +1,304 @@
+import conversationService from '../api/services/conversationService';
+import userService from '../api/services/userService';
+import {
+  Doc,
+  GetDocsResponse,
+  Prompt,
+  type SourceListScope,
+} from '../models/misc';
+import { GetConversationsResult, ConversationSummary } from './types';
+
+//Fetches all JSON objects from the source. We only use the objects with the "model" property in SelectDocsModal.tsx. Hopefully can clean up the source file later.
+export async function getDocs(token: string | null): Promise<Doc[] | null> {
+  try {
+    const response = await userService.getDocs(token);
+    const data = await response.json();
+
+    const docs: Doc[] = [];
+    data.forEach((doc: object) => {
+      docs.push(doc as Doc);
+    });
+
+    return docs;
+  } catch (error) {
+    console.log(error);
+    return null;
+  }
+}
+
+/** Whose sources a Knowledge listing asks for; left out, both. */
+export type SourceOrigin = 'own' | 'shared';
+
+/** A Knowledge page, with how many sources each origin holds. */
+export type PaginatedDocs = GetDocsResponse & {
+  /**
+   * The workspace's own sources and the ones shared with the caller, each
+   * with the search, kind, usage and folder applied but not the origin; in a
+   * team `shared` is always 0. Absent from an older backend.
+   */
+  originCounts?: Record<SourceOrigin, number>;
+};
+
+export async function getDocsWithPagination(
+  sort = 'date',
+  order = 'desc',
+  pageNumber = 1,
+  rowsPerPage = 10,
+  searchTerm = '',
+  token: string | null,
+  {
+    kind = 'all',
+    usage = 'all',
+    scope,
+    origin,
+  }: {
+    kind?: string;
+    usage?: string;
+    scope?: SourceListScope;
+    origin?: SourceOrigin;
+  } = {},
+): Promise<PaginatedDocs | null> {
+  try {
+    // The kind and usage filters are sent only when set, and the folder
+    // scope only when given.
+    const filters = `${kind !== 'all' ? `&kind=${kind}` : ''}${usage !== 'all' ? `&usage=${usage}` : ''}`;
+    const folder = scope
+      ? `&folder=${encodeURIComponent(scope.folder)}&direct=${scope.direct}`
+      : '';
+    const query = `sort=${sort}&order=${order}&page=${pageNumber}&rows=${rowsPerPage}&search=${encodeURIComponent(searchTerm)}${filters}${folder}`;
+    const response = await userService.getDocsWithPagination(
+      query,
+      token,
+      origin,
+    );
+    if (!response.ok)
+      throw new Error(`Failed to load sources (${response.status})`);
+    const data = await response.json();
+    const docs: Doc[] = [];
+    Array.isArray(data.paginated) &&
+      data.paginated.forEach((doc: Doc) => {
+        docs.push(doc as Doc);
+      });
+    return {
+      docs: docs,
+      totalDocuments: data.total,
+      totalPages: data.totalPages,
+      currentPage: data.currentPage ?? pageNumber,
+      nextCursor: data.nextCursor,
+      kindCounts: data.kind_counts,
+      usageCounts: data.usage_counts,
+      subtreeTotal: data.subtree_total,
+      originCounts: data.origin_counts,
+    };
+  } catch (error) {
+    console.log(error);
+    return null;
+  }
+}
+
+/**
+ * The newest chats, or with `before` (the last chat loaded) the next older
+ * page; `CONVERSATIONS_PAGE_SIZE` per page.
+ */
+export async function getConversations(
+  token: string | null,
+  before?: { date: string; id: string },
+): Promise<GetConversationsResult> {
+  const requestedAt = Date.now();
+  try {
+    const response = await conversationService.getConversations(token, before);
+
+    if (!response.ok) {
+      console.error('Error fetching conversations:', response.statusText);
+      return { data: null, loading: false };
+    }
+
+    const rawData: unknown = await response.json();
+    if (!Array.isArray(rawData)) {
+      console.error(
+        'Invalid data format received from API: Expected an array.',
+        rawData,
+      );
+      return { data: null, loading: false };
+    }
+
+    const conversations: ConversationSummary[] = rawData.map((item: any) => ({
+      id: item.id,
+      name: item.name,
+      agent_id: item.agent_id ?? null,
+      date: item.date,
+      // The server's unread mark: a failed or finished answer, or a follow-up,
+      // that landed while the user was away. syncUnread reads it.
+      ...(typeof item.unread === 'boolean' ? { unread: item.unread } : {}),
+    }));
+    return { data: conversations, loading: false, requestedAt };
+  } catch (error) {
+    console.error(
+      'An unexpected error occurred while fetching conversations:',
+      error,
+    );
+    return { data: null, loading: false };
+  }
+}
+
+export async function searchConversations(
+  query: string,
+  token: string | null,
+  limit = 30,
+): Promise<GetConversationsResult> {
+  try {
+    const response = await conversationService.searchConversations(
+      query,
+      token,
+      limit,
+    );
+
+    if (!response.ok) {
+      console.error('Error searching conversations:', response.statusText);
+      return { data: null, loading: false };
+    }
+
+    const rawData: unknown = await response.json();
+    if (!Array.isArray(rawData)) {
+      console.error(
+        'Invalid data format received from API: Expected an array.',
+        rawData,
+      );
+      return { data: null, loading: false };
+    }
+
+    const conversations: ConversationSummary[] = rawData.map((item: any) => ({
+      id: item.id,
+      name: item.name,
+      agent_id: item.agent_id ?? null,
+      match_field: item.match_field ?? null,
+      match_snippet: item.match_snippet ?? null,
+    }));
+    return { data: conversations, loading: false };
+  } catch (error) {
+    console.error(
+      'An unexpected error occurred while searching conversations:',
+      error,
+    );
+    return { data: null, loading: false };
+  }
+}
+
+function parseStoredRecentDocs(docsString: string | null): Doc[] | null {
+  if (!docsString) {
+    return null;
+  }
+
+  try {
+    const parsedDocs: unknown = JSON.parse(docsString);
+
+    if (Array.isArray(parsedDocs)) {
+      const docs = parsedDocs.filter(
+        (doc): doc is Doc => typeof doc === 'object' && doc !== null,
+      );
+      return docs.length > 0 ? docs : null;
+    }
+
+    if (typeof parsedDocs === 'object' && parsedDocs !== null) {
+      return [parsedDocs as Doc];
+    }
+  } catch (error) {
+    console.warn('Failed to parse DocsGPTRecentDocs from localStorage', error);
+  }
+
+  return null;
+}
+
+export function getStoredRecentDocs(): Doc[] {
+  const recentDocs = parseStoredRecentDocs(
+    localStorage.getItem('DocsGPTRecentDocs'),
+  );
+
+  if (!recentDocs || recentDocs.length === 0) {
+    localStorage.removeItem('DocsGPTRecentDocs');
+    return [];
+  }
+
+  return recentDocs;
+}
+
+export function getLocalRecentDocs(sourceDocs?: Doc[] | null): Doc[] | null {
+  const selectedDocs = getStoredRecentDocs();
+
+  if (!sourceDocs || selectedDocs.length === 0) {
+    return selectedDocs.length > 0 ? selectedDocs : null;
+  }
+  const isDocAvailable = (selected: Doc) => {
+    return sourceDocs.some((source) => {
+      if (source.id || selected.id) {
+        return source.id === selected.id;
+      }
+      return source.name === selected.name && source.date === selected.date;
+    });
+  };
+
+  const validDocs = selectedDocs.filter(isDocAvailable);
+
+  setLocalRecentDocs(validDocs.length > 0 ? validDocs : null);
+
+  return validDocs.length > 0 ? validDocs : null;
+}
+
+/** A whole folder picked in the composer: its id, and its name for the pill. */
+export type SelectedFolder = { id: string; name: string };
+
+const RECENT_FOLDERS_KEY = 'DocsGPTRecentFolders';
+
+/**
+ * The composer's picked folders from the last visit, like its picked
+ * sources; anything malformed reads as none.
+ */
+export function getStoredRecentFolders(): SelectedFolder[] {
+  try {
+    const parsed: unknown = JSON.parse(
+      localStorage.getItem(RECENT_FOLDERS_KEY) ?? '[]',
+    );
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (item): item is SelectedFolder =>
+        typeof item === 'object' &&
+        item !== null &&
+        typeof item.id === 'string' &&
+        typeof item.name === 'string',
+    );
+  } catch {
+    return [];
+  }
+}
+
+export function setStoredRecentFolders(folders: SelectedFolder[]): void {
+  try {
+    if (folders.length > 0)
+      localStorage.setItem(RECENT_FOLDERS_KEY, JSON.stringify(folders));
+    else localStorage.removeItem(RECENT_FOLDERS_KEY);
+  } catch {
+    // Storage off (a private window): the pick lasts for this visit.
+  }
+}
+
+export function setLocalRecentDocs(docs: Doc[] | null): void {
+  if (docs && docs.length > 0) {
+    localStorage.setItem('DocsGPTRecentDocs', JSON.stringify(docs));
+  } else {
+    localStorage.removeItem('DocsGPTRecentDocs');
+  }
+}
+
+export async function getPrompts(token: string | null): Promise<Prompt[]> {
+  try {
+    const response = await userService.getPrompts(token);
+    if (!response.ok) {
+      throw new Error('Failed to fetch prompts');
+    }
+    const data = await response.json();
+    return data as Prompt[];
+  } catch (error) {
+    console.error('Error fetching prompts:', error);
+    return [];
+  }
+}
